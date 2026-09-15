@@ -31,9 +31,15 @@ local Config = {
     Leash = 350,         -- mob di atas jarak ini tidak dikejar (anti void/lobby)
     BlessPick = 1,       -- 1=kiri, 2=tengah, 3=kanan
     PotionThreshold = 45,
+    AutoPotion = true,
+    AutoChest = true,    -- ambil chest per-room
+    AutoClaim = true,    -- claim mid/end chest + potion + collect gear
     RoomRadius = 120,    -- radius sapu mob per-room dari tengah room
     ChestRadius = 150,   -- radius ambil chest per-room
     Dwell = 1.2,         -- jeda tiap titik biar spawn/trigger kebaca
+    Noclip = false,      -- tembus tembok
+    Speed = 28,          -- WalkSpeed (default game ~16-28)
+    JumpPower = 50,      -- JumpPower (default 50)
 }
 
 -- Blacklist dummy/NPC (bukan musuh): nama + folder terlarang
@@ -194,18 +200,22 @@ local function Session()
 end
 
 local function ClaimAll()
-    pcall(function()
-        RF_Run.SelectMidRunChests:InvokeServer({ 1, 2 })
-        RF_Run.SelectChests:InvokeServer({ 1, 2 })
-        local hud = LocalPlayer.PlayerGui:FindFirstChild("Main")
-        hud = hud and hud:FindFirstChild("HUD")
-        local cf = hud and hud:FindFirstChild("Chest_Selection")
-        if cf then cf.Visible = false end
-    end)
-    pcall(function() RF_Gear.CollectAll:InvokeServer() end)
-    local h = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-    if h and h.MaxHealth > 0 and (h.Health / h.MaxHealth * 100) < Config.PotionThreshold then
-        pcall(function() RF_Potion.UsePotion:InvokeServer(1) end)
+    if Config.AutoClaim then
+        pcall(function()
+            RF_Run.SelectMidRunChests:InvokeServer({ 1, 2 })
+            RF_Run.SelectChests:InvokeServer({ 1, 2 })
+            local hud = LocalPlayer.PlayerGui:FindFirstChild("Main")
+            hud = hud and hud:FindFirstChild("HUD")
+            local cf = hud and hud:FindFirstChild("Chest_Selection")
+            if cf then cf.Visible = false end
+        end)
+        pcall(function() RF_Gear.CollectAll:InvokeServer() end)
+    end
+    if Config.AutoPotion then
+        local h = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if h and h.MaxHealth > 0 and (h.Health / h.MaxHealth * 100) < Config.PotionThreshold then
+            pcall(function() RF_Potion.UsePotion:InvokeServer(1) end)
+        end
     end
 end
 
@@ -375,8 +385,8 @@ local function FarmLoop(gen)
             task.wait(0.1)
         end
         -- 4) ambil SEMUA chest room ini dulu, baru pindah
-        LootChestsNear(z.Pos, Config.ChestRadius)
-        ClaimAll()
+        if Config.AutoChest then LootChestsNear(z.Pos, Config.ChestRadius) end
+        if Config.AutoClaim or Config.AutoPotion then ClaimAll() end
         idx += 1
         task.wait(0.3)
     end
@@ -415,7 +425,7 @@ pcall(function()
     end)
 end)
 
--- ============================== UI MINIMAL (murni Roblox) ==============================
+-- ============================== UI BAWAAN (murni Roblox, tanpa library) ==============================
 local gui = Instance.new("ScreenGui")
 gui.Name = "HartaKarunFarm"
 gui.ResetOnSpawn = false
@@ -423,8 +433,8 @@ pcall(function() gui.Parent = game:GetService("CoreGui") end)
 if not gui.Parent then gui.Parent = LocalPlayer.PlayerGui end
 
 local main = Instance.new("Frame")
-main.Size = UDim2.new(0, 280, 0, 400)
-main.Position = UDim2.new(0, 20, 0.5, -200)
+main.Size = UDim2.new(0, 280, 0, 430)
+main.Position = UDim2.new(0, 20, 0.5, -215)
 main.BackgroundColor3 = Color3.fromRGB(18, 20, 28)
 main.BorderSizePixel = 0
 main.Active = true
@@ -458,11 +468,23 @@ scroll.Size = UDim2.new(1, -16, 1, -100)
 scroll.Position = UDim2.new(0, 8, 0, 54)
 scroll.BackgroundTransparency = 1
 scroll.ScrollBarThickness = 4
-scroll.CanvasSize = UDim2.new(0, 0, 0, 480)
+scroll.CanvasSize = UDim2.new(0, 0, 0, 560)
 scroll.Parent = main
 local layout = Instance.new("UIListLayout")
 layout.Padding = UDim.new(0, 6)
 layout.Parent = scroll
+
+local function Section(text)
+    local l = Instance.new("TextLabel")
+    l.Size = UDim2.new(1, -8, 0, 18)
+    l.BackgroundTransparency = 1
+    l.Text = text
+    l.Font = Enum.Font.GothamBold
+    l.TextSize = 12
+    l.TextColor3 = Color3.fromRGB(255, 200, 90)
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.Parent = scroll
+end
 
 local function Toggle(text, key)
     local b = Instance.new("TextButton")
@@ -516,6 +538,7 @@ local function Slider(text, key, min, max, step)
     plus.MouseButton1Click:Connect(function() Config[key] = math.min(max, Config[key] + step) refresh() end)
 end
 
+Section("â€” FARM â€”")
 local farmBtn = Instance.new("TextButton")
 farmBtn.Size = UDim2.new(1, -8, 0, 32)
 farmBtn.BackgroundColor3 = Color3.fromRGB(60, 140, 70)
@@ -537,6 +560,12 @@ Toggle("Altar dulu saat START", "AltarFirst")
 Slider("Tinggi hover", "HoverHeight", 6, 30, 1)
 Slider("Jarak skill", "SkillRange", 20, 150, 5)
 Slider("Leash anti-void", "Leash", 100, 1000, 50)
+
+Section("â€” CHEST & BLESSING â€”")
+Toggle("Auto Chest per-room", "AutoChest")
+Toggle("Auto Claim + collect", "AutoClaim")
+Toggle("Auto Potion", "AutoPotion")
+Slider("Threshold potion %", "PotionThreshold", 10, 90, 5)
 
 local blessRow = Instance.new("Frame")
 blessRow.Size = UDim2.new(1, -8, 0, 28)
@@ -573,6 +602,12 @@ for i = 1, 3 do
     end)
 end
 
+Section("â€” PLAYER â€”")
+Toggle("Noclip (tembus tembok)", "Noclip")
+Slider("Speed", "Speed", 16, 120, 2)
+Slider("Jump High", "JumpPower", 50, 250, 10)
+
+Section("â€” AUTO START â€”")
 local soloBtn = Instance.new("TextButton")
 soloBtn.Size = UDim2.new(1, -8, 0, 28)
 soloBtn.BackgroundColor3 = Color3.fromRGB(50, 90, 150)
@@ -601,4 +636,25 @@ task.spawn(function()
     end
 end)
 
-print("[HartaKarunFarm] loaded. Tekan START FARM (altar -> zone 1..N -> chest).")
+-- Noclip + Speed + JumpHigh (movement, independen dari farm)
+task.spawn(function()
+    while gui.Parent do
+        pcall(function()
+            local ch = LocalPlayer.Character
+            local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+            if hum then
+                if hum.WalkSpeed ~= Config.Speed then hum.WalkSpeed = Config.Speed end
+                if hum.JumpPower ~= Config.JumpPower then hum.JumpPower = Config.JumpPower end
+                if hum.UseJumpPower == false then hum.UseJumpPower = true end
+                if Config.Noclip and ch then
+                    for _, v in ipairs(ch:GetDescendants()) do
+                        if v:IsA("BasePart") and v.CanCollide then v.CanCollide = false end
+                    end
+                end
+            end
+        end)
+        task.wait(0.3)
+    end
+end)
+
+print("[HartaKarunFarm] loaded mandiri (tanpa library). Tekan START FARM.")
