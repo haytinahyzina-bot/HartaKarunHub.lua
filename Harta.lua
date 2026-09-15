@@ -1943,51 +1943,110 @@ lib:Notify({
 })
 print("[HK] UI Obsidian aktif")
 
--- PATCH Harta.lua: altar-first beneran + BlessPick 1/2/3
+-- PATCH Harta.lua FINAL (gabungan v1+v2+v3 + perbaikan live)
 -- Cara pasang: paste SELURUH blok ini di BARIS PALING AKHIR file Harta.lua,
--- lalu Commit + pastikan file di GitHub ter-update. Tidak perlu edit kode lama.
+-- Commit, lalu re-execute dari raw URL. Tidak perlu edit kode lama.
+-- Isi: BlessPick 1/2/3 (ID-based) + poller 2 GUIs + altar-first kunci + chest global + zone-touch.
 
 _G.HKBlessPick = _G.HKBlessPick or 1   -- 1=kiri, 2=tengah, 3=kanan
 _G.HKAltarFirst = (_G.HKAltarFirst == nil) and true or _G.HKAltarFirst
+_G.HKChestReach = _G.HKChestReach or 3000
 
--- 1) Auto-pilih blessing sesuai nomor (altar maupun mid-run)
+-- 1) Auto-pilih blessing via ID buff (hp_up/skill_crit_dmg/dmg_up/...),
+--    fallback index mentah. Event + poller PlayerGui&CoreGui tiap 2 detik.
 task.spawn(function()
     local ok, svc = pcall(function()
         return game.ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"]
             .knit.Services.DungeonBuffService
     end)
     if not ok or not svc then return end
-    pcall(function()
-        svc.RE.BuffSelection.OnClientEvent:Connect(function(...)
-            _G.HKLastBless = { ... }
-            task.wait(0.4)
-            local pick = tonumber(_G.HKBlessPick) or 1
-            if pick < 1 or pick > 3 then pick = 1 end
-            pcall(function() svc.RF.SelectBuff:InvokeServer(pick) end)
+    local function pickNow()
+        local pick = tonumber(_G.HKBlessPick) or 1
+        if pick < 1 or pick > 3 then pick = 1 end
+        local id = nil
+        pcall(function()
+            local opts = _G.HKLastBless and _G.HKLastBless[1]
+            if type(opts) == "table" and type(opts[pick]) == "table" and opts[pick].Id then
+                id = tostring(opts[pick].Id)
+            end
         end)
+        if id then pcall(function() svc.RF.SelectBuff:InvokeServer(id) end) end
+        pcall(function() svc.RF.SelectBuff:InvokeServer(pick) end)
+    end
+    pcall(function()
+        if _G.BlessConn then pcall(function() _G.BlessConn:Disconnect() end) end
+        _G.BlessConn = svc.RE.BuffSelection.OnClientEvent:Connect(function(...)
+            _G.HKLastBless = { ... }
+            task.wait(0.3)
+            pickNow()
+        end)
+    end)
+    if _G.BlessPoll then pcall(function() _G.BlessPoll:Disconnect() end) end
+    _G.BlessPoll = game:GetService("RunService").Heartbeat:Connect(function()
+        local now = os.clock()
+        if _G._blessPollAt and now - _G._blessPollAt < 2 then return end
+        _G._blessPollAt = now
+        local found = false
+        for _, root in ipairs({ game.Players.LocalPlayer.PlayerGui, game:GetService("CoreGui") }) do
+            pcall(function()
+                for _, d in ipairs(root:GetDescendants()) do
+                    if d:IsA("TextLabel") and d.Text == "PILIH BERKAT:" then found = true break end
+                end
+            end)
+            if found then break end
+        end
+        if found then pickNow() end
     end)
 end)
 
--- 2) Tiap AUTO FARM baru dinyalakan: reset + langsung ke altar dulu
+-- 2) Tiap AUTO FARM ON / run baru: reset + kunci serang sampai altar pertama
 task.spawn(function()
-    local prev = false
+    local prevToggle, lastLoc, wasFull, lockUntil = nil, nil, false, 0
     while true do
-        local on = _G.HK and _G.HK.autoFarm
-        if on and not prev then
-            _G.HKAltarDone = {}   -- reset: altar boleh dikunjungi lagi run ini
-            _G.HKChestSkip = {}
-            _G.HKZone.lastRoom = nil
-            if _G.HKAltarFirst then
-                _G.HK.goAltar = true -- blok startup bawaan: altar -> gate 1
+        pcall(function()
+            local on = _G.HK and _G.HK.autoFarm
+            local loc, full = nil, false
+            local rf = game.ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"]
+                .knit.Services.DungeonRunService.RF.GetSessionInfo
+            local ok, s = pcall(function() return rf:InvokeServer() end)
+            if ok and type(s) == "table" then
+                loc = tostring(s.LocationId)
+                local rem, tot = tonumber(s.MobsRemaining), tonumber(s.TotalMobsInRoom)
+                if rem and tot and tot > 0 and rem >= tot then full = true end
             end
-        end
-        prev = on
-        task.wait(0.5)
+            local newRun = full and (not wasFull or (loc ~= nil and loc ~= lastLoc))
+            local toggled = on and not prevToggle
+            if (newRun or toggled) and on and _G.HKAltarFirst then
+                _G.HKAltarDone = {}
+                _G.HKChestSkip = {}
+                if _G.HKZone then _G.HKZone.lastRoom = nil end
+                _G.HKLockSaved = { atk = _G.HK.atk, skill = _G.HK.skill, hx = _G.HK.hx }
+                _G.HK.atk = false
+                _G.HK.skill = false
+                _G.HK.hx = false
+                _G.HK.goAltar = true
+                lockUntil = os.clock() + 20
+            end
+            if loc ~= nil then lastLoc = loc end
+            wasFull = full
+            if prevToggle == nil then prevToggle = on end
+            if lockUntil > 0 and os.clock() > lockUntil then lockUntil = 0 end
+            local done = false
+            for _ in pairs(_G.HKAltarDone or {}) do done = true break end
+            if (done or lockUntil == 0) and _G.HKLockSaved then
+                _G.HK.atk = _G.HKLockSaved.atk
+                _G.HK.skill = _G.HKLockSaved.skill
+                _G.HK.hx = _G.HKLockSaved.hx
+                _G.HKLockSaved = nil
+                lockUntil = 0
+            end
+            prevToggle = on
+        end)
+        task.wait(1)
     end
 end)
 
--- 3) Prioritas altar mid-run: kalau tidak ada target dan ada altar
---    belum dikunjungi, datangi DULU sebelum chest/patrol
+-- 3) Prioritas altar mid-run sebelum chest/patrol (saat tidak ada target)
 task.spawn(function()
     while true do
         if _G.HK and _G.HK.autoFarm and _G.HKT == nil and _G.HKAltarFirst then
@@ -2026,16 +2085,7 @@ task.spawn(function()
     end
 end)
 
-print("[HK] patch altar-first + blesspick aktif (pick=" .. tostring(_G.HKBlessPick) .. ")")
-
--- PATCH Harta.lua v2: chest fallback global + zone-touch idle
--- Cara pasang: paste SELURUH blok ini di BARIS PALING AKHIR file Harta.lua,
--- Commit, lalu re-execute dari raw URL. Tidak perlu edit kode lama.
-
-_G.HKChestReach = _G.HKChestReach or 3000 -- jarak maksimum kejar chest (studs)
-
--- 1) Chest fallback GLOBAL: kalau gate loop tidak dapat chest di room sendiri,
---    loop ini kejar chest aktif TERDEKAT di seluruh map (bukan diam).
+-- 4) Chest fallback GLOBAL (s/d 3000 studs) saat room sendiri kosong
 task.spawn(function()
     while true do
         if _G.HK and _G.HK.autoFarm and _G.HK.chest and _G.HKT == nil then
@@ -2068,7 +2118,7 @@ task.spawn(function()
                             end
                         end
                     end
-                    if best and bpr and bd > 60 then -- yang dekat biar gate loop yang urus
+                    if best and bpr and bd > 60 then
                         hrp.CFrame = CFrame.new(best + Vector3.new(0, 3, 2))
                         hrp.Velocity = Vector3.new()
                         task.wait(0.5)
@@ -2085,9 +2135,7 @@ task.spawn(function()
     end
 end)
 
--- 2) Zone-touch idle: mob 0 + tidak ada chest + slot belum complete ->
---    sentuh Zone tiap room berurutan (teleport center tidak cukup,
---    harus injak Zone volume). Terbukti mancing wave (Room_8 test).
+-- 5) Zone-touch idle: mob 0 -> sentuh Zone tiap room (mancing wave)
 task.spawn(function()
     local idx = 1
     local sessAt, sessMob = 0, nil
@@ -2143,4 +2191,4 @@ task.spawn(function()
     end
 end)
 
-print("[HK] patch v2 aktif: chest-global + zone-touch")
+print("[HK] patch FINAL aktif: bless-id + altar-lock + chest-global + zone-touch")
