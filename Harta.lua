@@ -1,1971 +1,1095 @@
--- Harta Karun Hub | single-file loader
--- Cara pakai di executor: loadstring(game:HttpGet("https://raw.githubusercontent.com/haytinahyzina-bot/HartaKarunHub/main/HartaKarunHub.lua"))()
+-- === HUB STRIP POINT - when executed through the hub ScriptLoader, which injects
+--     "local Library = _G.OxideLib" above this line instead. ===
+-- ==============================================================================
 
--- Harta Karun Dungeon | Farm v4 (tulis ulang bersih)
--- Satu scanner + satu hover + attack/skill/ESP/stealth/gate.
--- Semua fitur DEFAULT OFF, nyalakan dari dashboard.
--- (Auto-load teleport SENGAJA tidak dipakai: bikin double-load.)
+-- ==============================================================================
+-- RE-EXECUTION GUARD + RESOURCE TRACKING
+-- ==============================================================================
+do
+    local prev = _G.OxideDungeonLootr
+    if prev and type(prev.Unload) == "function" then pcall(prev.Unload) end
+end
+local HUB = { conns = {}, drawings = {}, highlights = {}, dead = false }
+_G.OxideDungeonLootr = HUB
+local function track(conn) table.insert(HUB.conns, conn); return conn end
+local function trackDrawing(d) if d then table.insert(HUB.drawings, d) end; return d end
 
-pcall(function()
-    if not game:IsLoaded() then
-        game.Loaded:Wait()
+local Window = Library:CreateWindow({
+    Name = "Oxide HUB | Dungeon-Lootr",
+    LoadingAnimation = true,
+    LoadingText = "Oxide",
+    LoadingDuration = 2.0,
+})
+
+-- ==============================================================================
+-- CONFIG / FLAG PERSISTENCE
+-- ==============================================================================
+local HAS_CONFIG = type(Library.SaveConfig) == "function"
+    and type(Library.LoadConfig) == "function"
+    and type(Library.ListConfigs) == "function"
+local CONFIG_NAME = "dungeonlootr"
+
+local dropdownResync = {}
+local function registerResync(handle, applyFn)
+    if handle and applyFn then
+        table.insert(dropdownResync, function() applyFn(handle:Get()) end)
     end
+end
+local function ResyncAll()
+    for _, fn in ipairs(dropdownResync) do pcall(fn) end
+end
+
+-- ==============================================================================
+-- SERVICES & LOCALS
+-- ==============================================================================
+local Players             = game:GetService("Players")
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local RunService          = game:GetService("RunService")
+local UserInputService    = game:GetService("UserInputService")
+local Workspace           = game:GetService("Workspace")
+local Lighting            = game:GetService("Lighting")
+local TeleportService     = game:GetService("TeleportService")
+local VirtualUser         = game:GetService("VirtualUser")
+local HttpService         = game:GetService("HttpService")
+
+local LocalPlayer = Players.LocalPlayer
+local Camera      = Workspace.CurrentCamera
+
+local function Notify(title, content, kind, dur)
+    pcall(function()
+        Window:Notify({ Title = title, Content = content, Type = kind or "Info", Duration = dur or 2.5 })
+    end)
+end
+
+local function safeCallback(fn)
+    return function(...)
+        local ok, err = pcall(fn, ...)
+        if not ok then
+            pcall(Notify, "Oxide HUB", "Error: " .. tostring(err), "Error", 4)
+        end
+    end
+end
+
+-- ==============================================================================
+-- CHARACTER & MOVEMENT HELPERS
+-- ==============================================================================
+local function GetCharacter() return LocalPlayer.Character end
+local function GetHumanoid()
+    local c = GetCharacter()
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+local function GetHRP()
+    local c = GetCharacter()
+    return c and (c:FindFirstChild("HumanoidRootPart") or c.PrimaryPart or c:FindFirstChildWhichIsA("BasePart"))
+end
+local function GetRootCFrame()
+    local hrp = GetHRP()
+    return hrp and hrp.CFrame
+end
+local function TeleportTo(pos)
+    local hrp = GetHRP()
+    if not hrp or not pos then return false end
+    hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+    return true
+end
+
+-- ==============================================================================
+-- GAME API & KNIT INTEGRATION (pcall-guarded)
+-- ==============================================================================
+local Knit
+pcall(function()
+    Knit = require(ReplicatedStorage:WaitForChild("Packages"):WaitForChild("Knit"))
 end)
-task.wait(2)
 
-_G.HK = _G.HK or {}
-_G.HK.hover = false
-_G.HK.height = _G.HK.height or 14
-_G.HK.chest = false
-_G.HK.atk = false
-_G.HK.atkRange = _G.HK.atkRange or 15
-_G.HK.skill = false
-_G.HK.rate = _G.HK.rate or 0.25
-_G.HK.esp = false
-_G.HK.loot = true
-_G.HK.dropLoot = false
-_G.HK.speed = 28
-_G.HK.noclip = false
-_G.HK.infjump = false
-_G.HK.fly = false
-_G.HK.flyspeed = _G.HK.flyspeed or 60
-_G.HK.tick = 0
-_G.HK.target = "none"
-_G.HK.stealth = false
-_G.HK.autoFarm = false
+local function GetKnitService(name)
+    if not Knit then return nil end
+    local ok, svc = pcall(function() return Knit.GetService(name) end)
+    return ok and svc or nil
+end
 
--- Pengecualian hover (nama model). NPC quest / dummy / pemain di-skip otomatis.
-_G.HKBlock = _G.HKBlock or { "Galran", "BananitaDolphinita", "Forge Archon", "Awakened Devil", "Rig" }
-_G.HKZone = { room = nil }
-_G.HKT = nil
-_G.HKAltarDone = _G.HKAltarDone or {}
+local function GetKnitController(name)
+    if not Knit then return nil end
+    local ok, ctrl = pcall(function() return Knit.GetController(name) end)
+    return ok and ctrl or nil
+end
 
--- Tombol skill (1-4) + heal (5). Ubah sesukamu.
-_G.HKSkillKeys = _G.HKSkillKeys or { "One", "Two", "Three", "Four" }
-_G.HK.autoHeal = false
+-- Dynamic Remotes Resolver (prevents stale refs across teleports)
+local function GetAttackRemote()
+    return ReplicatedStorage:FindFirstChild("Player")
+        and ReplicatedStorage.Player:FindFirstChild("Remotes")
+        and ReplicatedStorage.Player.Remotes:FindFirstChild("Inputs")
+        and ReplicatedStorage.Player.Remotes.Inputs:FindFirstChild("Attack")
+end
 
--- ID animasi ayunan (stealth). Damage tetap masuk (server-side).
-_G.HKSwingIds = {
-    ["106806110702885"] = true, ["109893308802725"] = true,
-    ["126671356379936"] = true, ["112357005052418"] = true,
-    ["105520255900501"] = true, ["113090603838738"] = true,
-    ["82343948148104"] = true,
+local function GetSkillRemote()
+    return ReplicatedStorage:FindFirstChild("Player")
+        and ReplicatedStorage.Player:FindFirstChild("Remotes")
+        and ReplicatedStorage.Player.Remotes:FindFirstChild("Inputs")
+        and ReplicatedStorage.Player.Remotes.Inputs:FindFirstChild("Skill")
+end
+
+local function GetDashRemote()
+    return ReplicatedStorage:FindFirstChild("Player")
+        and ReplicatedStorage.Player:FindFirstChild("Remotes")
+        and ReplicatedStorage.Player.Remotes:FindFirstChild("Inputs")
+        and ReplicatedStorage.Player.Remotes.Inputs:FindFirstChild("Dash")
+end
+
+local function GetParryRemote()
+    return ReplicatedStorage:FindFirstChild("Player")
+        and ReplicatedStorage.Player:FindFirstChild("Remotes")
+        and ReplicatedStorage.Player.Remotes:FindFirstChild("Inputs")
+        and ReplicatedStorage.Player.Remotes.Inputs:FindFirstChild("Parry")
+end
+
+local function FireAttack(dir)
+    local r = GetAttackRemote()
+    if r then
+        pcall(function() r:FireServer(dir or Vector3.new(0, 0, 1)) end)
+    end
+end
+
+local function FireSkill(key, mode, dir)
+    local r = GetSkillRemote()
+    if r then
+        pcall(function() r:FireServer(key, mode or "tap", dir or Vector3.new(0, 0, 1)) end)
+    end
+end
+
+local function FireDash(dir)
+    local r = GetDashRemote()
+    if r then
+        pcall(function() r:FireServer(dir or Vector3.new(0, 0, 1)) end)
+    end
+end
+
+local function FireParry()
+    local r = GetParryRemote()
+    if r then
+        pcall(function() r:FireServer() end)
+    end
+end
+
+-- Active codes list from CodesData
+local ALL_ACTIVE_CODES = {
+    "FULLRELEASE", "LOOTR", "LOOTRISBACK", "8KLIKE", "20KPLAYERS",
+    "JACKPOT", "10KFAV", "RELEASE", "FORGESKIP", "GIVEMEGEMSPLEASE"
 }
 
-local P = game.Players.LocalPlayer
-local RS = game:GetService("RunService")
-local UIS = game:GetService("UserInputService")
--- Lazy: folder Player belum tentu ter-replikasi saat execute (fresh inject).
-local function getInputs()
-    local ok, r = pcall(function()
-        return game.ReplicatedStorage:WaitForChild("Player", 5).Remotes.Inputs
-    end)
-    if ok then
-        return r
-    end
-end
-local HKVIM = nil
-pcall(function() HKVIM = game:GetService("VirtualInputManager") end)
+-- Dungeon names
+local DUNGEONS = {
+    "Bandits Den", "Forest Challenge", "Goblins", "Knights", "Catacombs",
+    "Snow", "Demon", "Throne Room", "Double Dungeon"
+}
 
-local function getGen()
-    for _, c in ipairs(workspace:GetChildren()) do
-        if string.find(c.Name, "Generated") then
-            return c
+local DIFFICULTIES = {
+    "Easy", "Normal", "Hard", "Nightmare", "Endless"
+}
+
+-- Dynamic Boss Names Map from GameInfo.DungeonData
+local BossNamesMap = {
+    ["Bandit Chief"] = true,
+    ["Bandit Enforcer"] = true,
+    ["Knight Lord"] = true,
+    ["Goblin Warchief"] = true,
+    ["Awakened Devil"] = true,
+    ["Frigid Monarch"] = true,
+    ["Valkskar"] = true,
+    ["Frost Warden"] = true,
+    ["Tenebris"] = true,
+    ["Karasu"] = true,
+    ["Cursed King"] = true,
+    ["Forge Archon"] = true,
+    ["Imperator"] = true,
+    ["Broken Reality"] = true,
+    ["Kieru"] = true,
+    ["Scarlet Knight"] = true,
+    ["Shadow Monarch"] = true,
+}
+pcall(function()
+    local ddata = require(ReplicatedStorage:WaitForChild("GameInfo"):WaitForChild("DungeonData"))
+    if ddata and ddata.Dungeons then
+        for _, dinfo in pairs(ddata.Dungeons) do
+            if dinfo.Boss and dinfo.Boss.Name then
+                BossNamesMap[dinfo.Boss.Name] = true
+                local simpleName = dinfo.Boss.Name:match("^([^,]+)")
+                if simpleName then BossNamesMap[simpleName] = true end
+            end
+            if dinfo.MiniBoss and dinfo.MiniBoss.Name then
+                BossNamesMap[dinfo.MiniBoss.Name] = true
+                local simpleName = dinfo.MiniBoss.Name:match("^([^,]+)")
+                if simpleName then BossNamesMap[simpleName] = true end
+            end
+            if dinfo.SpecialBoss and dinfo.SpecialBoss.Name then
+                BossNamesMap[dinfo.SpecialBoss.Name] = true
+                local simpleName = dinfo.SpecialBoss.Name:match("^([^,]+)")
+                if simpleName then BossNamesMap[simpleName] = true end
+            end
+            if dinfo.BossRotation then
+                for _, b in ipairs(dinfo.BossRotation) do
+                    if b.Name then
+                        BossNamesMap[b.Name] = true
+                        local simpleName = b.Name:match("^([^,]+)")
+                        if simpleName then BossNamesMap[simpleName] = true end
+                    end
+                end
+            end
         end
     end
-    return nil
+end)
+
+-- ==============================================================================
+-- ENEMY & TARGET SCANNER (Supports both Lobby Dummies & Generated Dungeons)
+-- ==============================================================================
+local function IsAlive(model)
+    if not model or not model.Parent then return false end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return false end
+    return true
 end
 
-local function mobAlive(m)
-    for _, n in ipairs(_G.HKBlock) do
-        if m.Name == n then
-            return false
+local function IsFriendlyNPC(model)
+    if not model or not model.Parent then return true end
+    if model.Parent.Name == "Dialogue_NPCS" or model.Parent.Name == "Dialogue" then
+        return true
+    end
+    if model:FindFirstChild("Dialogue") or model:GetAttribute("Dialogue") then
+        return true
+    end
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("ProximityPrompt") and (d.ActionText == "Talk" or d.ActionText == "Chat" or d.ActionText == "Interact") then
+            return true
         end
-    end
-    local fn = m:GetFullName()
-    if string.find(fn, "Dialogue_NPCS")
-        or string.find(fn, "Combat_Dummies")
-        or string.find(fn, "PlayerModels") then
-        return false
-    end
-    local hum = m:FindFirstChildOfClass("Humanoid")
-    if hum and hum.Health > 0 then
-        return true
-    end
-    local st = m:GetAttribute("State")
-    if m:GetAttribute("CanAttack") == true and st ~= "Dead" then
-        return true
-    end
-    if m:GetAttribute("HealthOverride") ~= nil and st ~= "Dead" then
-        return true
     end
     return false
 end
 
-local function mobHP(m)
-    local hum = m:FindFirstChildOfClass("Humanoid")
-    if hum then
-        return hum.Health
-    end
-    local ov = m:GetAttribute("HealthOverride")
-    if type(ov) == "number" then
-        return ov
-    end
-    return 1e9
+local function IsBoss(model)
+    if not model then return false end
+    local name = model.Name
+    if BossNamesMap[name] then return true end
+    local simpleName = name:match("^([^,]+)")
+    if simpleName and BossNamesMap[simpleName] then return true end
+    if model:GetAttribute("IsBoss") or model:GetAttribute("Boss") then return true end
+    if model:FindFirstChild("BossBar") or model:FindFirstChild("BossHealth") then return true end
+    return false
 end
 
-local function mobPart(m)
-    return m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("Torso")
+local function GetModelRoot(model)
+    if not model then return nil end
+    return model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or model:FindFirstChild("Torso") or model:FindFirstChild("UpperTorso") or model:FindFirstChildWhichIsA("BasePart")
 end
 
--- Posisi target: part tubuh kalau ada, kalau belum materialisasi
--- (boss: aksesoris ada, badan belum) pakai tengah bounding box.
-local function mobPos(m)
-    local th = mobPart(m)
-    if th then
-        return th.Position, th
-    end
-    local ok, cf = pcall(function() return m:GetBoundingBox() end)
-    if ok and cf then
-        return cf.Position, nil
-    end
+local function GetModelPosition(model)
+    local root = GetModelRoot(model)
+    if root then return root.Position, root end
+    local ok, cf = pcall(function() return model:GetPivot() end)
+    if ok and cf then return cf.Position, nil end
     return nil, nil
 end
 
--- Scanner: tiap 0.5 dtk petakan mob hidup ke room, prioritaskan
--- darah terendah di room aktif. Di luar Generated tetap dilirik
--- (maks 600 stud) supaya event tidak ke-skip total.
-task.spawn(function()
-    while true do
-        pcall(function()
-            local hrp = P.Character and P.Character:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                local chars = {}
-                for _, pl in ipairs(game.Players:GetPlayers()) do
-                    if pl.Character then
-                        chars[pl.Character] = true
-                    end
-                end
-                local gen = getGen()
-                local scope = gen or workspace
-                local rooms = {}
-                if gen then
-                    for _, c in ipairs(gen:GetChildren()) do
-                        local n = string.match(c.Name, "^Room_(%d+)$")
-                        if n and c:IsA("Model") then
-                            local ok, piv = pcall(function() return c:GetPivot() end)
-                            if ok then
-                                rooms[tonumber(n)] = piv.Position
-                            end
-                        end
-                    end
-                end
-                local byRoom = {}
-                local best, bestRoom, bd = nil, nil, 1e9
-                for _, d in ipairs(scope:GetDescendants()) do
-                    if d:IsA("Model") and d ~= P.Character and not chars[d] then
-                        if mobAlive(d) then
-                            local pos = mobPos(d)
+local function GetAllTargets(includeDummies, includeEnemies, maxDist)
+    local targets = {}
+    local hrp = GetHRP()
+    local myPos = hrp and hrp.Position or Vector3.zero
+    local seen = {}
+    local inDungeon = LocalPlayer:GetAttribute("InDungeon") == true
+
+    -- 1. Dungeon / World Enemies
+    if includeEnemies then
+        local searchContainers = {}
+        for _, c in ipairs(Workspace:GetChildren()) do
+            if c.Name:find("Generated_") or c.Name == "Enemy Models" or c.Name == "NPCs" or c.Name == "Enemies" then
+                table.insert(searchContainers, c)
+            end
+        end
+        if not inDungeon or #searchContainers == 0 then
+            table.insert(searchContainers, Workspace)
+        end
+
+        for _, container in ipairs(searchContainers) do
+            local models = (container == Workspace) and container:GetChildren() or container:GetDescendants()
+            for _, m in ipairs(models) do
+                if m:IsA("Model") and not seen[m] and m ~= GetCharacter() and not Players:GetPlayerFromCharacter(m) then
+                    if not IsFriendlyNPC(m) then
+                        local hum = m:FindFirstChildOfClass("Humanoid")
+                        if hum and hum.Health > 0 then
+                            local pos, root = GetModelPosition(m)
                             if pos then
-                                local dist = (pos - hrp.Position).Magnitude
-                                if dist < 600 then
-                                    local rn, rd = 0, 1e9
-                                    for n, rpos in pairs(rooms) do
-                                        local dxz = Vector2.new(
-                                            pos.X - rpos.X,
-                                            pos.Z - rpos.Z).Magnitude
-                                        if dxz < rd then
-                                            rn, rd = n, dxz
-                                        end
-                                    end
-                                    byRoom[rn] = byRoom[rn] or {}
-                                    table.insert(byRoom[rn], { m = d, hp = mobHP(d) })
-                                    if dist < bd then
-                                        best, bestRoom, bd = d, rn, dist
-                                    end
+                                seen[m] = true
+                                local dist = (pos - myPos).Magnitude
+                                if not maxDist or dist <= maxDist then
+                                    table.insert(targets, {
+                                        Model = m,
+                                        HRP = root or m:FindFirstChildWhichIsA("BasePart"),
+                                        Pos = pos,
+                                        Dist = dist,
+                                        IsBoss = IsBoss(m),
+                                        Type = "Enemy"
+                                    })
                                 end
                             end
                         end
                     end
                 end
-                local cur = _G.HKZone.room
-                local tgt = nil
-                if cur and byRoom[cur] and #byRoom[cur] > 0 then
-                    table.sort(byRoom[cur], function(a, b) return a.hp < b.hp end)
-                    tgt = byRoom[cur][1]
-                elseif best then
-                    _G.HKZone.room = bestRoom
-                    _G.HKZone.lastRoom = bestRoom
-                    tgt = { m = best, hp = mobHP(best) }
-                else
-                    _G.HKZone.room = nil
-                end
-                _G.HKT = tgt and tgt.m or nil
-                if _G.HKZone.room then
-                    _G.HKZone.lastRoom = _G.HKZone.room
-                end
-                if tgt then
-                    _G.HK.target = "R" .. tostring(_G.HKZone.room) .. " "
-                        .. tgt.m.Name .. " hp" .. tostring(math.floor(tgt.hp))
-                else
-                    _G.HK.target = "no mob"
-                end
-            end
-        end)
-        task.wait(0.5)
-    end
-end)
-
--- Loop utama: speed lock + noclip + fly + hover tidur.
-RS.Heartbeat:Connect(function()
-    _G.HK.tick += 1
-    local ch = P.Character
-    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    if not hrp or not hum or hum.Health <= 0 then
-        _G.HK.target = "dead/none"
-        return
-    end
-    if _G.HK.noclip then
-        for _, v in ipairs(ch:GetDescendants()) do
-            if v:IsA("BasePart") and v.CanCollide then
-                v.CanCollide = false
             end
         end
     end
-    if hum.WalkSpeed ~= _G.HK.speed then
-        hum.WalkSpeed = _G.HK.speed
-    end
-    if _G.HK.fly then
-        local cf = hrp.CFrame
-        local mv = Vector3.new()
-        if UIS:IsKeyDown(Enum.KeyCode.W) then mv += workspace.CurrentCamera.CFrame.LookVector end
-        if UIS:IsKeyDown(Enum.KeyCode.S) then mv -= workspace.CurrentCamera.CFrame.LookVector end
-        if UIS:IsKeyDown(Enum.KeyCode.A) then mv -= workspace.CurrentCamera.CFrame.RightVector end
-        if UIS:IsKeyDown(Enum.KeyCode.D) then mv += workspace.CurrentCamera.CFrame.RightVector end
-        if UIS:IsKeyDown(Enum.KeyCode.Space) then mv += Vector3.new(0, 1, 0) end
-        if UIS:IsKeyDown(Enum.KeyCode.LeftControl) then mv -= Vector3.new(0, 1, 0) end
-        if mv.Magnitude > 0 then
-            hrp.CFrame = cf + mv.Unit * (_G.HK.flyspeed * 0.05)
-            hrp.Velocity = Vector3.new()
-        end
-    end
-    local mob = _G.HKT
-    if mob and mob.Parent and not mobAlive(mob) then
-        mob = nil
-    end
-    if _G.HK.hx and mob then
-        local pos = mobPos(mob)
-        if pos then
-            hum.AutoRotate = false
-            local h = _G.HK.height
-            if h > 30 then
-                h = 30
-            end
-            if h < 4 then
-                h = 4
-            end
-            hrp.CFrame = CFrame.new(pos + Vector3.new(0, h, 0), pos)
-            hrp.Velocity = Vector3.new()
-            hrp.RotVelocity = Vector3.new()
-        end
-    else
-        hum.AutoRotate = true
-        if mob then
-            _G.HK.target = mob.Name .. " (hover off)"
-        end
-    end
-end)
 
--- Attack: hanya kalau target dalam jarak atkRange.
-task.spawn(function()
-    while true do
-        if _G.HK.atk then
-            pcall(function()
-                local mob = _G.HKT
-                local hrp = P.Character and P.Character:FindFirstChild("HumanoidRootPart")
-                if mob and mob.Parent and hrp then
-                    local pos = mobPos(mob)
-                    if pos and (pos - hrp.Position).Magnitude <= (_G.HK.atkRange or 15) then
-                        local inp = getInputs()
-                        if inp then
-                            inp.Attack:FireServer()
-                        end
-                    end
-                end
-            end)
-        end
-        task.wait(_G.HK.rate)
-    end
-end)
-
--- Skill via hotkey (1-4): hanya kalau target dalam jarak. Heal (5) saat HP<40%.
-task.spawn(function()
-    while true do
-        if _G.HK.skill and HKVIM then
-            pcall(function()
-                local mob = _G.HKT
-                local hrp = P.Character and P.Character:FindFirstChild("HumanoidRootPart")
-                local inRange = false
-                if mob and mob.Parent and hrp then
-                    local pos = mobPos(mob)
-                    if pos and (pos - hrp.Position).Magnitude <= (_G.HK.atkRange or 15) then
-                        inRange = true
-                    end
-                end
-                if inRange then
-                    for _, kn in ipairs(_G.HKSkillKeys or {}) do
-                        if not _G.HK.skill then
-                            break
-                        end
-                        HKVIM:SendKeyEvent(true, Enum.KeyCode[kn], false, game)
-                        task.wait(0.05)
-                        HKVIM:SendKeyEvent(false, Enum.KeyCode[kn], false, game)
-                        task.wait(1.5)
-                    end
-                end
-            end)
-        end
-        task.wait(0.5)
-    end
-end)
-
-task.spawn(function()
-    while true do
-        if _G.HK.autoHeal and HKVIM then
-            pcall(function()
-                local hum = P.Character and P.Character:FindFirstChildOfClass("Humanoid")
-                if hum and hum.MaxHealth > 0 and hum.Health / hum.MaxHealth < 0.4 then
-                    HKVIM:SendKeyEvent(true, Enum.KeyCode.Five, false, game)
-                    task.wait(0.05)
-                    HKVIM:SendKeyEvent(false, Enum.KeyCode.Five, false, game)
-                end
-            end)
-        end
-        task.wait(2)
-    end
-end)
-
--- Infinite jump.
-UIS.JumpRequest:Connect(function()
-    if _G.HK.infjump and P.Character then
-        local hum = P.Character:FindFirstChildOfClass("Humanoid")
-        if hum then
-            hum:ChangeState(Enum.HumanoidStateType.Jumping)
-        end
-    end
-end)
-
--- ESP: merah = Humanoid, oranye = attribute (Lv + State).
--- Scope dungeon saja + tiap 5 detik (hemat FPS).
-task.spawn(function()
-    while true do
-        if _G.HK.esp then
-            pcall(function()
-                local scope = getGen() or workspace
-                for _, d in ipairs(scope:GetDescendants()) do
-                    if d:IsA("Model") and d ~= P.Character and not d:FindFirstChild("HK_ESP") then
-                        local skip = false
-                        for _, pl in ipairs(game.Players:GetPlayers()) do
-                            if pl.Character == d then
-                                skip = true
-                                break
-                            end
-                        end
-                        local label, color = nil, Color3.new(1, 0.35, 0.35)
-                        if not skip then
-                            local hum = d:FindFirstChildOfClass("Humanoid")
-                            if hum and hum.Health > 0 then
-                                label = d.Name .. " " .. tostring(math.floor(hum.Health))
-                            elseif mobAlive(d) then
-                                label = d.Name .. " Lv" .. tostring(d:GetAttribute("Level"))
-                                    .. " " .. tostring(d:GetAttribute("State"))
-                                color = Color3.new(1, 0.6, 0.2)
-                            end
-                        end
-                        if label then
-                            local ador = mobPart(d)
-                            if not ador then
-                                local _, p2 = mobPos(d)
-                                ador = p2
-                            end
-                            if ador then
-                                local bb = Instance.new("BillboardGui")
-                                bb.Name = "HK_ESP"
-                                bb.Size = UDim2.new(0, 150, 0, 32)
-                                bb.StudsOffset = Vector3.new(0, 3, 0)
-                                bb.AlwaysOnTop = true
-                                bb.Adornee = ador
-                                bb.Parent = d
-                                local tl = Instance.new("TextLabel")
-                                tl.Size = UDim2.new(1, 0, 1, 0)
-                                tl.BackgroundTransparency = 1
-                                tl.TextColor3 = color
-                                tl.TextStrokeTransparency = 0
-                                tl.TextSize = 13
-                                tl.Font = Enum.Font.Code
-                                tl.Text = label
-                                tl.Parent = bb
-                            end
-                        end
-                    end
-                end
-            end)
-        end
-        task.wait(5)
-    end
-end)
-
--- Stealth: potong ayunan pre-render. Damage tetap masuk (server-side).
-RS.RenderStepped:Connect(function()
-    if not (_G.HK and _G.HK.stealth) then
-        return
-    end
-    local ch = P.Character
-    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    local anim = hum and hum:FindFirstChildOfClass("Animator")
-    if not anim then
-        return
-    end
-    for _, tr in ipairs(anim:GetPlayingAnimationTracks()) do
-        local id = tr.Animation and tr.Animation.AnimationId or ""
-        local num = string.match(id, "(%d+)")
-        if num and _G.HKSwingIds[num] then
-            pcall(function() tr:Stop(0) end)
-        end
-    end
-end)
-
--- Gate loop = alur full user:
---   1. Run fresh -> altar dulu (pilih otomatis via picker).
---   2. Kembali gate 1 -> bunuh semua (hover farm).
---   3. Scan chest gate itu -> datangi + buka (tunggu kebuka).
---   4. Tidak ada -> gate berikut. Ulang sampai boss mati.
---   5. Popup 2-dari-3 dipilih otomatis (poller terpisah).
--- Reset per run terdeteksi via TotalMobs (penuh = run baru).
-_G.HKAltarDone = _G.HKAltarDone or {}
-_G.HKChestSkip = _G.HKChestSkip or {}
-task.spawn(function()
-    while true do
-        if _G.HK.chest and _G.HKT == nil then
-            pcall(function()
-                local hrp = P.Character and P.Character:FindFirstChild("HumanoidRootPart")
-                if hrp then
-                    local gen = getGen()
-                    if gen then
-                        local rooms = {}
-                        for _, c in ipairs(gen:GetChildren()) do
-                            local n = string.match(c.Name, "^Room_(%d+)$")
-                            if n and c:IsA("Model") then
-                                local ok, piv = pcall(function() return c:GetPivot() end)
-                                if ok then
-                                    table.insert(rooms, { n = tonumber(n), pos = piv.Position })
-                                end
-                            end
-                        end
-                        table.sort(rooms, function(a, b) return a.n < b.n end)
-                        local function roomOf(pos)
-                            local rn, rd = 0, 1e9
-                            for _, r in ipairs(rooms) do
-                                local dxz = Vector2.new(
-                                    pos.X - r.pos.X, pos.Z - r.pos.Z).Magnitude
-                                if dxz < rd then
-                                    rn, rd = r.n, dxz
-                                end
-                            end
-                            return rn
-                        end
-                        -- Aturan ketat user: mob room habis -> chest ROOM ITU
-                        -- dulu (semua), baru pindah gate. Skip direset tiap
-                        -- ada chest yang berhasil dibuka (dependency maju).
-                        local cur = _G.HKZone.room or _G.HKZone.lastRoom
-                        if not cur then
-                            -- Reload tengah run: tebak room dari posisi pemain.
-                            cur = roomOf(hrp.Position)
-                            if cur and cur ~= 0 then
-                                _G.HKZone.lastRoom = cur
-                            else
-                                cur = nil
-                            end
-                        end
-                        _G.HKChestSkip = _G.HKChestSkip or {}
-                        -- Run fresh (mob masih penuh, belum pernah farm):
-                        -- ke altar berkah DULU, baru mulai dari gate 1.
-                        local freshRun = false
-                        if _G.HKZone.lastRoom == nil then
-                            pcall(function()
-                                local rf = game.ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"]
-                                    .knit.Services.DungeonRunService.RF.GetSessionInfo
-                                local s = rf:InvokeServer()
-                                if type(s) == "table" and tonumber(s.MobsRemaining)
-                                    and tonumber(s.TotalMobsInRoom)
-                                    and tonumber(s.MobsRemaining) >= tonumber(s.TotalMobsInRoom)
-                                    and tonumber(s.TotalMobsInRoom) > 0 then
-                                    freshRun = true
-                                end
-                            end)
-                        end
-                        if _G.HKZone.lastRoom == nil and not freshRun and cur then
-                            _G.HKZone.lastRoom = cur
-                        end
-                        if freshRun then
-                            local altar0, apr0, abd0 = nil, nil, 1e9
-                            for _, d in ipairs(gen:GetDescendants()) do
-                                if d:IsA("ProximityPrompt") and d.Enabled
-                                    and string.find(string.lower(d.ActionText), "bless") then
-                                    local m = d.Parent
-                                    while m and not m:IsA("Model") do
-                                        m = m.Parent
-                                    end
-                                    if m and not _G.HKAltarDone[m:GetFullName()] then
-                                        local ok, piv = pcall(function() return m:GetPivot() end)
-                                        if ok then
-                                            local dist = (piv.Position - hrp.Position).Magnitude
-                                            if dist < abd0 then
-                                                altar0, abd0, apr0 = m, dist, d
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-                            if altar0 and apr0 then
-                                _G.HKAltarDone[altar0:GetFullName()] = true
-                                local piv = altar0:GetPivot()
-                                hrp.CFrame = CFrame.new(piv.X, piv.Y + 4, piv.Z + 2)
-                                hrp.Velocity = Vector3.new()
-                                task.wait(0.6)
-                                pcall(function() fireproximityprompt(apr0) end)
-                                task.wait(1.5)
-                            else
-                                local r1 = nil
-                                for _, r in ipairs(rooms) do
-                                    if r.n == 1 or not r1 or r.n < r1.n then
-                                        r1 = r
-                                    end
-                                end
-                                if r1 then
-                                    hrp.CFrame = CFrame.new(r1.pos.X, r1.pos.Y + 5, r1.pos.Z)
-                                    hrp.Velocity = Vector3.new()
-                                    _G.HKZone.room = r1.n
-                                end
-                            end
-                        end
-                        local tgt, pr = nil, nil
-                        if cur then
-                            local bd = 1e9
-                            for _, d in ipairs(gen:GetDescendants()) do
-                                if d:IsA("ProximityPrompt") and d.Enabled
-                                    and string.find(string.lower(d.ActionText), "loot") then
-                                    local m = d.Parent
-                                    while m and not m:IsA("Model") do
-                                        m = m.Parent
-                                    end
-                                    if m and not _G.HKChestSkip[m:GetFullName()] then
-                                        local ok, piv = pcall(function() return m:GetPivot() end)
-                                        if ok and roomOf(piv.Position) == cur then
-                                            local dist = (piv.Position - hrp.Position).Magnitude
-                                            if dist < bd then
-                                                tgt, pr, bd = m, d, dist
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-                        end
-                        if tgt and pr then
-                            local piv = tgt:GetPivot()
-                            hrp.CFrame = CFrame.new(piv.X, piv.Y + 4, piv.Z + 2)
-                            hrp.Velocity = Vector3.new()
-                            local opened = false
-                            for i = 1, 8 do
-                                task.wait(0.7)
-                                if not pr.Enabled then
-                                    opened = true
-                                    break
-                                end
-                                pcall(function() fireproximityprompt(pr) end)
-                                if _G.HKT ~= nil then
-                                    break
-                                end
-                            end
-                            if not opened and pr.Enabled then
-                                _G.HKChestSkip[tgt:GetFullName()] = true
-                            elseif opened then
-                                _G.HKChestSkip = {}
-                            end
-                        else
-                            local altar, apr, abd = nil, nil, 1e9
-                            for _, d in ipairs(gen:GetDescendants()) do
-                                if d:IsA("ProximityPrompt") and d.Enabled
-                                    and string.find(string.lower(d.ActionText), "bless") then
-                                    local m = d.Parent
-                                    while m and not m:IsA("Model") do
-                                        m = m.Parent
-                                    end
-                                    if m and not _G.HKAltarDone[m:GetFullName()] then
-                                        local ok, piv = pcall(function() return m:GetPivot() end)
-                                        if ok then
-                                            local dist = (piv.Position - hrp.Position).Magnitude
-                                            if dist < abd then
-                                                altar, abd, apr = m, dist, d
-                                            end
-                                        end
-                                    end
-                                end
-                            end
-                            if altar and apr then
-                                _G.HKAltarDone[altar:GetFullName()] = true
-                                local piv = altar:GetPivot()
-                                hrp.CFrame = CFrame.new(piv.X, piv.Y + 4, piv.Z + 2)
-                                hrp.Velocity = Vector3.new()
-                                task.wait(0.6)
-                                pcall(function() fireproximityprompt(apr) end)
-                            elseif cur then
-                                -- Maju HANYA kalau sesi bilang masih ada mob
-                                -- (kalau 0 = tidak ada kerjaan, diam, jangan
-                                -- muter-muter). Cek sesi max tiap 10 detik.
-                                local now = os.clock()
-                                if _G.HKSessAt == nil or now - _G.HKSessAt > 10 then
-                                    _G.HKSessAt = now
-                                    _G.HKSessMob = nil
-                                    pcall(function()
-                                        local rf = game.ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"]
-                                            .knit.Services.DungeonRunService.RF.GetSessionInfo
-                                        local s = rf:InvokeServer()
-                                        if type(s) == "table" and tonumber(s.MobsRemaining) then
-                                            _G.HKSessMob = tonumber(s.MobsRemaining)
-                                        end
-                                    end)
-                                end
-                                if _G.HKSessMob == nil or _G.HKSessMob > 0 then
-                                    local nxt = nil
-                                    for _, r in ipairs(rooms) do
-                                        if r.n > cur and (not nxt or r.n < nxt.n) then
-                                            nxt = r
-                                        end
-                                    end
-                                    if not nxt then
-                                        nxt = rooms[1]
-                                    end
-                                    if nxt then
-                                        hrp.CFrame = CFrame.new(nxt.pos.X, nxt.pos.Y + 5, nxt.pos.Z)
-                                        hrp.Velocity = Vector3.new()
-                                    end
-                                end
-                            end
-                        end
-                    end
-                end
-            end)
-        end
-        task.wait(2)
-    end
-end)
-
--- Auto loot drop monster: dengar event SpawnDrops, petakan pasangan
--- (id, posisi) dari payload, teleport dekat, panggil CollectDrop.
--- Bentuk payload tidak tetap jadi parser-nya adaptif; semua aman di-pcall.
-_G.HKDropQueue = _G.HKDropQueue or {}
-task.spawn(function()
-    local svc = game.ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"].knit.Services
-    local ds = svc:FindFirstChild("DropService")
-    local sp = ds and ds.RE and ds.RE:FindFirstChild("SpawnDrops")
-    local cd = ds and ds.RF and ds.RF:FindFirstChild("CollectDrop")
-    if sp then
-        pcall(function()
-            sp.OnClientEvent:Connect(function(...)
-                for _, a in ipairs({ ... }) do
-                    local function walk(t, ctx)
-                        if type(t) ~= "table" then
-                            return
-                        end
-                        ctx = ctx or {}
-                        for k, v in pairs(t) do
-                            if type(v) == "table" then
-                                walk(v, ctx)
-                            elseif typeof(v) == "Vector3" or typeof(v) == "CFrame" then
-                                ctx.pos = v
-                            elseif type(v) == "string" and #v > 3 then
-                                ctx.id = v
-                            elseif type(v) == "number" and v > 1000 then
-                                ctx.numId = v
-                            end
-                        end
-                        if ctx.pos and (ctx.id or ctx.numId) then
-                            table.insert(_G.HKDropQueue, {
-                                id = ctx.id or ctx.numId,
-                                pos = ctx.pos,
+    -- 2. Combat Dummies (in lobby)
+    if includeDummies then
+        local dummies = Workspace:FindFirstChild("Combat_Dummies")
+        if dummies then
+            for _, d in ipairs(dummies:GetChildren()) do
+                if d:IsA("Model") and not seen[d] then
+                    local pos, root = GetModelPosition(d)
+                    if pos then
+                        seen[d] = true
+                        local dist = (pos - myPos).Magnitude
+                        if not maxDist or dist <= maxDist then
+                            table.insert(targets, {
+                                Model = d,
+                                HRP = root or d:FindFirstChildWhichIsA("BasePart"),
+                                Pos = pos,
+                                Dist = dist,
+                                IsBoss = false,
+                                Type = "Dummy"
                             })
                         end
                     end
-                    walk(a)
                 end
-            end)
-        end)
-    end
-    while true do
-        if _G.HK.dropLoot and cd and #_G.HKDropQueue > 0 then
-            pcall(function()
-                local hrp = P.Character and P.Character:FindFirstChild("HumanoidRootPart")
-                if hrp then
-                    local job = table.remove(_G.HKDropQueue, 1)
-                    if job then
-                        local p = job.pos
-                        if typeof(p) == "CFrame" then
-                            p = p.Position
-                        end
-                        if typeof(p) == "Vector3" then
-                            hrp.CFrame = CFrame.new(p + Vector3.new(0, 4, 0))
-                            hrp.Velocity = Vector3.new()
-                            task.wait(0.4)
-                        end
-                        pcall(function() cd:InvokeServer(job.id) end)
-                    end
-                end
-            end)
+            end
         end
-        task.wait(0.8)
     end
-end)
 
--- Wave navigator: baca progress wave dari UI (slot Completed/Treasure/
--- kosong/Boss), teleport ke wave tempur yang belum selesai. Dijalankan
--- saat tidak ada target mob. Cache room di-rebuild berkala (streaming!).
-_G.HKWaveNav = _G.HKWaveNav == nil and true or _G.HKWaveNav
-_G.HKCombatRooms = nil
-_G.HKGenName = nil
-_G.HKRoomsAt = 0
-task.spawn(function()
-    while true do
-        if _G.HKWaveNav and _G.HKT == nil then
-            pcall(function()
-                local P2 = game.Players.LocalPlayer
-                local hrp = P2.Character and P2.Character:FindFirstChild("HumanoidRootPart")
-                if hrp then
-                    local gen = getGen()
-                    if gen then
-                        local now = os.clock()
-                        if _G.HKGenName ~= gen.Name or not _G.HKCombatRooms or now - _G.HKRoomsAt > 30 then
-                            _G.HKGenName = gen.Name
-                            _G.HKRoomsAt = now
-                            _G.HKCombatRooms = {}
-                            for _, c in ipairs(gen:GetChildren()) do
-                                local n = string.match(c.Name, "^Room_(%d+)$")
-                                if n and c:IsA("Model") then
-                                    local hasSpawn = false
-                                    local sp = c:FindFirstChild("Spawns")
-                                    if sp then
-                                        for _, s in ipairs(sp:GetChildren()) do
-                                            if string.find(s.Name, "Enemy") then
-                                                hasSpawn = true
-                                                break
-                                            end
-                                        end
-                                    end
-                                    if hasSpawn then
-                                        local ok, piv = pcall(function() return c:GetPivot() end)
-                                        if ok then
-                                            table.insert(_G.HKCombatRooms, {
-                                                n = tonumber(n),
-                                                pos = piv.Position,
-                                            })
-                                        end
-                                    end
-                                end
-                            end
-                            table.sort(_G.HKCombatRooms, function(a, b) return a.n < b.n end)
-                        end
-                        local cp = P2.PlayerGui.Main.HUD.Dungeon_Container
-                            :FindFirstChild("Completion_Progress")
-                        local list = cp and cp:FindFirstChild("List")
-                        if list and _G.HKCombatRooms and #_G.HKCombatRooms > 0 then
-                            local slots = {}
-                            for _, c in ipairs(list:GetChildren()) do
-                                if c:IsA("ImageLabel")
-                                    and (c.Name == "Zone" or c.Name == "ZoneSlot") then
-                                    table.insert(slots, c)
-                                end
-                            end
-                            for i, s in ipairs(slots) do
-                                local done, isBoss = false, false
-                                for _, cc in ipairs(s:GetChildren()) do
-                                    if cc:IsA("ImageLabel") and cc.Visible then
-                                        if cc.Name == "Completed" then
-                                            done = true
-                                        end
-                                        if cc.Name == "Boss" then
-                                            isBoss = true
-                                        end
-                                    end
-                                end
-                                if not done and not isBoss then
-                                    local dest = _G.HKCombatRooms[math.min(i, #_G.HKCombatRooms)]
-                                    _G.HKWaveNote = "wave" .. tostring(i) .. "->R" .. tostring(dest.n)
-                                    hrp.CFrame = CFrame.new(dest.pos.X, dest.pos.Y + 5, dest.pos.Z)
-                                    hrp.Velocity = Vector3.new()
-                                    break
-                                end
-                            end
-                        end
-                    end
-                end
-            end)
+    table.sort(targets, function(a, b) return a.Dist < b.Dist end)
+    return targets
+end
+
+local function GetClosestTarget(targetMode, maxDist)
+    local inclDummies = (targetMode == "Target Dummies" or targetMode == "All Targets" or targetMode == "Legit Directional")
+    local inclEnemies = (targetMode == "Target Nearest" or targetMode == "Target Boss Only" or targetMode == "All Targets" or targetMode == "Legit Directional")
+    local targets = GetAllTargets(inclDummies, inclEnemies, maxDist)
+
+    if targetMode == "Target Boss Only" then
+        for _, t in ipairs(targets) do
+            if t.IsBoss then return t end
         end
-        task.wait(3)
+        return nil
+    elseif targetMode == "Target Dummies" then
+        for _, t in ipairs(targets) do
+            if t.Type == "Dummy" then return t end
+        end
+        return nil
     end
-end)
-pcall(function()
-    local VU = game:GetService("VirtualUser")
-    P.Idled:Connect(function()
-        VU:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
-        task.wait(1)
-        VU:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+
+    return targets[1]
+end
+
+-- ==============================================================================
+-- TWEAK (Harta): batas jarak tembak skill. Skill/attack dari loop Auto Skills
+-- HANYA keluar kalau ada mob hidup dalam radius ini (default 75 studs).
+-- Ganti live via: _G.HartaSkillRange = 60
+-- ==============================================================================
+_G.HartaSkillRange = _G.HartaSkillRange or 75
+local function MobInSkillRange()
+    local hrp = GetHRP()
+    if not hrp then return false end
+    local r = tonumber(_G.HartaSkillRange) or 75
+    local t = GetClosestTarget("All Targets", r)
+    return t and t.Pos and (t.Pos - hrp.Position).Magnitude <= r or false
+end
+
+-- ==============================================================================
+-- COMBAT & AUTO-FARM STATE (Defaults: all auto features off by default)
+-- ==============================================================================
+local killAuraEnabled     = false
+local killAuraMode        = "All Targets"
+local killAuraRadius      = 50
+local killAuraDelay       = 0.08
+local killAuraFaceTarget  = true
+
+local autoSkillsEnabled   = false
+local skill1Enabled       = true
+local skill2Enabled       = true
+local skill3Enabled       = true
+local skill4Enabled       = true
+local skillUltEnabled     = true
+
+local autoPotionEnabled   = false
+local autoPotionThreshold = 45
+
+local hitboxExpanderEnabled = false
+local hitboxSize            = 15
+local hitboxTransparency    = 0.6
+
+-- Dungeon Automation
+local autoDungeonAfkGrind = false
+local selectedDungeon     = "Bandits Den"
+local selectedDifficulty  = "Normal"
+local autoSoloQueue       = false
+local autoReplayDungeon   = false
+local autoReturnLobby     = false
+local autoClaimMidChests  = false
+local autoClaimEndChests  = false
+local autoLootRoomChests  = false
+local autoLootBossChests  = false
+local autoClaimAltars     = false
+local autoRefillPotions   = false
+local autoUnlockDoors     = false
+local autoTeleportLoot    = true
+local autoNextMobTeleport = false
+
+-- Economy & Farm
+local autoCollectDrops      = false
+local autoCollectFloorGear  = false
+local autoClaimAchievements = false
+local autoClaimQuests       = false
+local autoFreeChest         = false
+local autoSellLootStorage   = false
+local autoAllocateStats     = false
+local autoAllocateStatChoice = "AutoAllocate"
+
+local autoSpinEnabled       = false
+local autoSpinType          = "Normal"
+
+-- ==============================================================================
+-- CHEST CLAIMING & INSTANT PROXIMITY TELEPORT LOOTING
+-- ==============================================================================
+
+local function DismissChestSelectionUI()
+    pcall(function()
+        local csc = GetKnitController("ChestSelectionController")
+        if csc then csc:_Reset() end
     end)
+    pcall(function()
+        local cframe = LocalPlayer.PlayerGui.Main.HUD:FindFirstChild("Chest_Selection")
+        if cframe then cframe.Visible = false end
+    end)
+end
+
+local function ClaimMidRunChestsInternal(ownsExtraLoot)
+    local drs = GetKnitService("DungeonRunService")
+    if not drs then return false end
+    local picks = ownsExtraLoot and { 1, 2, 3 } or { 1, 2 }
+    local ok, res = pcall(function() return drs:SelectMidRunChests(picks):await() end)
+    DismissChestSelectionUI()
+    return ok
+end
+
+local function ClaimEndChestsInternal(ownsExtraLoot)
+    local drs = GetKnitService("DungeonRunService")
+    if not drs then return false end
+    local picks = ownsExtraLoot and { 1, 2, 3 } or { 1, 2 }
+    local ok, res = pcall(function() return drs:SelectChests(picks):await() end)
+    DismissChestSelectionUI()
+    return ok
+end
+
+local function ClaimBossRushChestsInternal(ownsExtraLoot)
+    local brs = GetKnitService("BossRushService")
+    if not brs then return false end
+    local picks = ownsExtraLoot and { 1, 2, 3 } or { 1, 2 }
+    local ok, res = pcall(function() return brs:SelectFloorChests(picks):await() end)
+    DismissChestSelectionUI()
+    return ok
+end
+
+-- Teleports directly next to prompt's part, triggers proximity prompt, and optionally restores position
+local function TeleportAndTriggerPrompt(prompt, returnBack)
+    if not prompt or not prompt.Enabled or not prompt.Parent then return false end
+    local hrp = GetHRP()
+    if not hrp then return false end
+
+    local part = prompt.Parent
+    if part:IsA("Attachment") then part = part.Parent end
+    if not (part and part:IsA("BasePart")) then
+        local model = prompt:FindFirstAncestorOfClass("Model")
+        part = model and (model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart"))
+    end
+    if not part then return false end
+
+    local origCf = hrp.CFrame
+    local targetCf = part.CFrame + Vector3.new(0, 2, 2)
+
+    hrp.CFrame = targetCf
+    task.wait(0.06)
+    pcall(function() fireproximityprompt(prompt) end)
+    task.wait(0.06)
+
+    if returnBack then
+        hrp.CFrame = origCf
+        task.wait(0.04)
+    end
+    return true
+end
+
+local function LootAllPhysicalRoomChests(returnBack)
+    local hrp = GetHRP()
+    local origCf = hrp and hrp.CFrame
+    local count = 0
+
+    for _, d in ipairs(Workspace:GetDescendants()) do
+        if d:IsA("ProximityPrompt") and d.Enabled and d.Name == "ChestPrompt" then
+            local parentModel = d:FindFirstAncestorOfClass("Model")
+            if parentModel and (parentModel.Name:find("DungeonChest") or parentModel:GetAttribute("DungeonChest") or parentModel.Name:find("BossLootChest")) then
+                if autoTeleportLoot then
+                    TeleportAndTriggerPrompt(d, false)
+                else
+                    pcall(function() fireproximityprompt(d) end)
+                end
+                count = count + 1
+            end
+        end
+    end
+
+    if returnBack and origCf and hrp then
+        hrp.CFrame = origCf
+    end
+    return count
+end
+
+local function LootAllBossLootChests(returnBack)
+    local hrp = GetHRP()
+    local origCf = hrp and hrp.CFrame
+    local count = 0
+    local bossChests = Workspace:FindFirstChild("_LocalBossLootChests")
+
+    if bossChests then
+        for _, chest in ipairs(bossChests:GetChildren()) do
+            local prompt = chest:FindFirstChild("ChestPrompt", true) or chest:FindFirstChildWhichIsA("ProximityPrompt", true)
+            if prompt and prompt.Enabled then
+                if autoTeleportLoot then
+                    TeleportAndTriggerPrompt(prompt, false)
+                else
+                    pcall(function() fireproximityprompt(prompt) end)
+                end
+                count = count + 1
+            end
+        end
+    end
+
+    if returnBack and origCf and hrp then
+        hrp.CFrame = origCf
+    end
+    return count
+end
+
+local function ClaimAllBlessingAltars(returnBack)
+    local hrp = GetHRP()
+    local origCf = hrp and hrp.CFrame
+    local count = 0
+
+    for _, d in ipairs(Workspace:GetDescendants()) do
+        if d:IsA("Model") and d.Name == "Blessing_Altar" then
+            local prompt = d:FindFirstChildWhichIsA("ProximityPrompt", true)
+            if prompt and prompt.Enabled then
+                if autoTeleportLoot then
+                    TeleportAndTriggerPrompt(prompt, false)
+                else
+                    pcall(function() fireproximityprompt(prompt) end)
+                end
+                count = count + 1
+            end
+        end
+    end
+
+    if returnBack and origCf and hrp then
+        hrp.CFrame = origCf
+    end
+    return count
+end
+
+local function RefillAllPotionStations(returnBack)
+    local hrp = GetHRP()
+    local origCf = hrp and hrp.CFrame
+    local count = 0
+
+    for _, d in ipairs(Workspace:GetDescendants()) do
+        if d:IsA("Model") and d.Name == "Potion_Station" then
+            local prompt = d:FindFirstChildWhichIsA("ProximityPrompt", true)
+            if prompt and prompt.Enabled then
+                if autoTeleportLoot then
+                    TeleportAndTriggerPrompt(prompt, false)
+                else
+                    pcall(function() fireproximityprompt(prompt) end)
+                end
+                count = count + 1
+            end
+        end
+    end
+
+    if returnBack and origCf and hrp then
+        hrp.CFrame = origCf
+    end
+    return count
+end
+
+local function UnlockAllKeyDoors(returnBack)
+    local hrp = GetHRP()
+    local origCf = hrp and hrp.CFrame
+    local count = 0
+
+    for _, d in ipairs(Workspace:GetDescendants()) do
+        if d:IsA("ProximityPrompt") and d.Enabled and (d.ActionText:find("Key") or d.ActionText:find("Unlock") or (d.Parent and d.Parent.Name:find("KeyModel"))) then
+            if autoTeleportLoot then
+                TeleportAndTriggerPrompt(d, false)
+            else
+                pcall(function() fireproximityprompt(d) end)
+            end
+            count = count + 1
+        end
+    end
+
+    if returnBack and origCf and hrp then
+        hrp.CFrame = origCf
+    end
+    return count
+end
+
+local function LootEverythingInDungeon(returnBack)
+    local hrp = GetHRP()
+    local origCf = hrp and hrp.CFrame
+    local total = 0
+
+    total = total + LootAllPhysicalRoomChests(false)
+    total = total + LootAllBossLootChests(false)
+    total = total + ClaimAllBlessingAltars(false)
+    total = total + RefillAllPotionStations(false)
+    if autoUnlockDoors then
+        total = total + UnlockAllKeyDoors(false)
+    end
+
+    if returnBack and origCf and hrp then
+        hrp.CFrame = origCf
+    end
+    return total
+end
+
+-- ==============================================================================
+-- COMBAT WORKER LOOPS
+-- ==============================================================================
+-- 1. Kill Aura Loop (Supports Target Modes, Face Target, Legit Directional)
+task.spawn(function()
+    while not HUB.dead do
+        if killAuraEnabled or autoDungeonAfkGrind then
+            local target = GetClosestTarget(killAuraMode, killAuraRadius)
+            local hrp = GetHRP()
+            if hrp and target and target.Pos then
+                local dir = (target.Pos - hrp.Position).Unit
+                if killAuraFaceTarget then
+                    pcall(function()
+                        hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(target.Pos.X, hrp.Position.Y, target.Pos.Z))
+                    end)
+                end
+                FireAttack(dir)
+            elseif hrp and killAuraMode == "Legit Directional" then
+                local cam = Camera
+                local camDir = cam and cam.CFrame.LookVector or Vector3.new(0, 0, 1)
+                FireAttack(Vector3.new(camDir.X, 0, camDir.Z).Unit)
+            end
+        end
+        task.wait(killAuraDelay)
+    end
 end)
 
--- Start-up: saat AUTO FARM dinyalakan, LANGSUNG ke altar dulu
--- (tanpa syarat apa pun), baru ke gate 1. Dipicu sekali per toggle-ON
--- lewat _G.HK.goAltar.
-_G.HK.goAltar = false
+-- 2. Auto Skills Loop (Casts Skills 1-4 and Ultimate when ready)
 task.spawn(function()
-    while true do
-        if _G.HK.goAltar then
-            _G.HK.goAltar = false
-            pcall(function()
-                local hrp = P.Character and P.Character:FindFirstChild("HumanoidRootPart")
-                local gen = getGen()
-                if hrp and gen then
-                    local best, bd, bpr = nil, 1e9, nil
-                    for _, d in ipairs(gen:GetDescendants()) do
-                        if d:IsA("ProximityPrompt") and d.Enabled
-                            and string.find(string.lower(d.ActionText), "bless") then
-                            local m = d.Parent
-                            while m and not m:IsA("Model") do
-                                m = m.Parent
-                            end
-                            if m then
-                                local ok, piv = pcall(function() return m:GetPivot() end)
-                                if ok then
-                                    local dist = (piv.Position - hrp.Position).Magnitude
-                                    if dist < bd then
-                                        best, bd, bpr = m, dist, d
-                                    end
-                                end
-                            end
-                        end
-                    end
-                    if best and bpr then
-                        local piv = best:GetPivot()
-                        hrp.CFrame = CFrame.new(piv.X, piv.Y + 4, piv.Z + 2)
-                        hrp.Velocity = Vector3.new()
-                        task.wait(0.7)
-                        pcall(function() fireproximityprompt(bpr) end)
-                        task.wait(1.5)
-                    end
-                    for _, c in ipairs(gen:GetChildren()) do
-                        local n = string.match(c.Name, "^Room_(%d+)$")
-                        if n and tonumber(n) == 1 and c:IsA("Model") then
-                            local ok, piv = pcall(function() return c:GetPivot() end)
-                            if ok then
-                                hrp.CFrame = CFrame.new(piv.X, piv.Y + 5, piv.Z)
-                                hrp.Velocity = Vector3.new()
-                            end
-                            break
-                        end
-                    end
-                    _G.HKZone.room = 1
-                    _G.HKZone.lastRoom = 1
+    while not HUB.dead do
+        if autoSkillsEnabled or autoDungeonAfkGrind then
+            local target = GetClosestTarget("All Targets", 60)
+            local hrp = GetHRP()
+            -- TWEAK (Harta): di luar jarak skill -> jangan buang cooldown
+            if hrp and MobInSkillRange() then
+                local dir
+                if target and target.Pos then
+                    dir = (target.Pos - hrp.Position).Unit
+                else
+                    local look = Camera and Camera.CFrame.LookVector or hrp.CFrame.LookVector
+                    dir = Vector3.new(look.X, 0, look.Z).Unit
                 end
-            end)
+
+                if skill1Enabled and not LocalPlayer:GetAttribute("Skill1_OnCooldown") then
+                    FireSkill(1, "tap", dir)
+                    task.wait(0.04)
+                end
+                if skill2Enabled and not LocalPlayer:GetAttribute("Skill2_OnCooldown") then
+                    FireSkill(2, "tap", dir)
+                    task.wait(0.04)
+                end
+                if skill3Enabled and not LocalPlayer:GetAttribute("Skill3_OnCooldown") then
+                    FireSkill(3, "tap", dir)
+                    task.wait(0.04)
+                end
+                if skill4Enabled and not LocalPlayer:GetAttribute("Skill4_OnCooldown") then
+                    FireSkill(4, "tap", dir)
+                    task.wait(0.04)
+                end
+                if skillUltEnabled and (LocalPlayer:GetAttribute("UltimateReady") == true or (not LocalPlayer:GetAttribute("SkillE_OnCooldown") and LocalPlayer:GetAttribute("HasUltimate") == true)) then
+                    FireSkill("E", "tap", dir)
+                    task.wait(0.04)
+                end
+            end
+        end
+        task.wait(0.12)
+    end
+end)
+
+-- 3. Auto Health Potion Loop
+task.spawn(function()
+    while not HUB.dead do
+        if autoPotionEnabled or autoDungeonAfkGrind then
+            local hum = GetHumanoid()
+            if hum and hum.MaxHealth > 0 then
+                local hpPct = (hum.Health / hum.MaxHealth) * 100
+                if hpPct <= autoPotionThreshold then
+                    local ps = GetKnitService("PotionService")
+                    if ps then pcall(function() ps:UsePotion(1):await() end) end
+                end
+            end
+        end
+        task.wait(0.4)
+    end
+end)
+
+-- 4. Hitbox Expander Loop
+task.spawn(function()
+    while not HUB.dead do
+        if hitboxExpanderEnabled then
+            local targets = GetAllTargets(true, true, 300)
+            for _, t in ipairs(targets) do
+                local root = t.HRP
+                if root and root.Parent then
+                    pcall(function()
+                        root.Size = Vector3.new(hitboxSize, hitboxSize, hitboxSize)
+                        root.Transparency = hitboxTransparency
+                        root.CanCollide = false
+                    end)
+                end
+            end
+        end
+        task.wait(1)
+    end
+end)
+
+-- ==============================================================================
+-- DUNGEON AUTOMATION & FULL AFK GRINDER
+-- ==============================================================================
+local function StartSoloDungeon(dungeonName, difficulty)
+    local dqs = GetKnitService("DungeonQueueService")
+    if not dqs then return false end
+    local ok, res = pcall(function()
+        dqs:RequestSelectMode("Solo"):await()
+        dqs:RequestSelectDungeon(dungeonName):await()
+        dqs:RequestSelectDifficulty(difficulty):await()
+        dqs:RequestStartSoloRun():await()
+    end)
+    return ok
+end
+
+local function ReturnToLobby()
+    local drs = GetKnitService("DungeonRunService")
+    if drs then pcall(function() drs:RequestReturn():await() end) end
+end
+
+local function RequestReplay()
+    local drs = GetKnitService("DungeonRunService")
+    if drs then pcall(function() drs:RequestReplay():await() end) end
+end
+
+local function CollectAllFloorGear()
+    local es = GetKnitService("EquipmentService")
+    if not es then return false end
+    local ok, res = pcall(function() return es:CollectAll():await() end)
+    return ok and res
+end
+
+local function CollectDropsNearby()
+    local ds = GetKnitService("DropService")
+    local loot = Workspace:FindFirstChild("Loot") or Workspace:FindFirstChild("Collectables")
+
+    if loot then
+        for _, item in ipairs(loot:GetChildren()) do
+            local prompt = item:FindFirstChildOfClass("ProximityPrompt") or item:FindFirstChildWhichIsA("ProximityPrompt", true)
+            if prompt and prompt.Enabled then
+                pcall(function() fireproximityprompt(prompt) end)
+            end
+        end
+    end
+
+    for _, c in ipairs(Workspace:GetChildren()) do
+        local dropId = c:GetAttribute("DropId") or c:GetAttribute("BatchId")
+        local dropType = c:GetAttribute("DropType") or "Coin"
+        local dropVal = c:GetAttribute("Value") or 1
+        if dropId and ds then
+            pcall(function() ds:CollectDrop(dropId, dropType, dropVal):await() end)
+        end
+    end
+end
+
+local function ClaimAllAchievements()
+    local as = GetKnitService("AchievementService")
+    if not as then return false end
+    local ok, res = pcall(function() return as:ClaimAll():await() end)
+    return ok and res
+end
+
+local function ClaimAllQuests()
+    local qs = GetKnitService("QuestService")
+    if not qs then return false end
+    pcall(function()
+        for i = 1, 5 do
+            qs:ClaimQuest("Daily", i):await()
+            qs:ClaimQuest("Weekly", i):await()
+        end
+    end)
+    return true
+end
+
+local function RedeemAllCodes()
+    local cs = GetKnitService("CodesService")
+    if not cs then return 0 end
+    local redeemed = 0
+    for _, code in ipairs(ALL_ACTIVE_CODES) do
+        local ok, s1 = pcall(function() return cs:RedeemCode(code):await() end)
+        if ok and s1 then redeemed = redeemed + 1 end
+        task.wait(0.15)
+    end
+    return redeemed
+end
+
+local function ClaimFreeChest()
+    local cs = GetKnitService("ChestService")
+    if not cs then return false end
+    local ok, res = pcall(function() return cs:ClaimFreeChest():await() end)
+    return ok and res
+end
+
+local function SellAllLoot()
+    local ss = GetKnitService("ShopService")
+    if not ss then return false end
+    local ok, res = pcall(function() return ss:SellAllLootStorage():await() end)
+    return ok and res
+end
+
+local function AllocateStatPoints(choice)
+    local ss = GetKnitService("StatService")
+    if not ss then return false end
+    pcall(function()
+        if choice == "AutoAllocate" or choice == "None" then
+            ss:AutoAllocate():await()
+        else
+            ss:AllocatePoints(choice, 5):await()
+        end
+    end)
+    return true
+end
+
+local function SpinClass(spinType)
+    local ss = GetKnitService("SummoningService")
+    if not ss then return false end
+    local ok, res = pcall(function() return ss:Spin(spinType, true):await() end)
+    return ok and res
+end
+
+-- Connect Dungeon Events for automatic chest claims & auto-progression
+task.spawn(function()
+    local drs = GetKnitService("DungeonRunService")
+    if drs then
+        if drs.ChestSelection then
+            track(drs.ChestSelection:Connect(function(candidates, ownsExtraLoot)
+                if autoClaimEndChests or autoDungeonAfkGrind then
+                    task.wait(0.2)
+                    ClaimEndChestsInternal(ownsExtraLoot)
+                end
+            end))
+        end
+        if drs.MidRunChestSelection then
+            track(drs.MidRunChestSelection:Connect(function(candidates, ownsExtraLoot)
+                if autoClaimMidChests or autoDungeonAfkGrind then
+                    task.wait(0.2)
+                    ClaimMidRunChestsInternal(ownsExtraLoot)
+                end
+            end))
+        end
+        if drs.DungeonComplete then
+            track(drs.DungeonComplete:Connect(function()
+                task.wait(1.2)
+                if autoClaimEndChests or autoDungeonAfkGrind then
+                    ClaimEndChestsInternal(false)
+                end
+                task.wait(1.5)
+                if autoReplayDungeon or autoDungeonAfkGrind then
+                    RequestReplay()
+                elseif autoReturnLobby then
+                    ReturnToLobby()
+                end
+            end))
+        end
+    end
+
+    local brs = GetKnitService("BossRushService")
+    if brs and brs.ChestSelection then
+        track(brs.ChestSelection:Connect(function(candidates, ownsExtraLoot)
+            if autoClaimMidChests or autoClaimEndChests or autoDungeonAfkGrind then
+                task.wait(0.2)
+                ClaimBossRushChestsInternal(ownsExtraLoot)
+            end
+        end))
+    end
+end)
+
+-- AFK Dungeon Grinder Loop
+local wasInDungeonTweak = false -- TWEAK (Harta): lacak transisi lobby -> dungeon
+task.spawn(function()
+    while not HUB.dead do
+        if autoDungeonAfkGrind then
+            local inDungeon = LocalPlayer:GetAttribute("InDungeon") == true
+            if inDungeon then
+                -- TWEAK (Harta): baru masuk dungeon -> altar dulu ambil blessing (ala video),
+                -- baru farm. Dijalankan sekali per masuk dungeon.
+                if not wasInDungeonTweak then
+                    wasInDungeonTweak = true
+                    pcall(function() ClaimAllBlessingAltars(false) end)
+                    task.wait(1.5) -- beri waktu UI PILIH BERKAT muncul -> auto-pick di bawah
+                end
+                -- 1. Check for alive enemies in current dungeon
+                local target = GetClosestTarget("Target Nearest", 2500)
+                local hrp = GetHRP()
+                if hrp and target and target.Pos then
+                    local dist = (target.Pos - hrp.Position).Magnitude
+                    -- TWEAK (Harta): hover 14 studs di atas mob, tidur tengkurap kepala ke mob
+                    if dist > 14 then
+                        hrp.CFrame = CFrame.lookAt(target.Pos + Vector3.new(0, 14, 0), target.Pos) * CFrame.Angles(math.rad(90), 0, 0)
+                    else
+                        hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(target.Pos.X, hrp.Position.Y, target.Pos.Z))
+                    end
+                else
+                    -- No alive enemies nearby: teleport-loot all chests, altars, potion stations, key doors
+                    LootEverythingInDungeon(false)
+                    pcall(CollectDropsNearby)
+                    pcall(CollectAllFloorGear)
+                end
+            else
+                -- In Lobby: Claim rewards, allocate stats, and queue solo dungeon
+                wasInDungeonTweak = false -- TWEAK (Harta): reset saat kembali lobby
+                pcall(ClaimFreeChest)
+                pcall(ClaimAllAchievements)
+                pcall(ClaimAllQuests)
+                pcall(CollectAllFloorGear)
+                if autoAllocateStats then pcall(function() AllocateStatPoints(autoAllocateStatChoice) end) end
+                StartSoloDungeon(selectedDungeon, selectedDifficulty)
+                task.wait(4)
+            end
+        end
+        task.wait(0.3)
+    end
+end)
+
+-- Dedicated Room & Boss Chest Auto-Looting Background Loop (Supports Any Distance via Fast Teleport)
+task.spawn(function()
+    while not HUB.dead do
+        if autoLootRoomChests or autoLootBossChests or autoClaimAltars or autoRefillPotions or autoDungeonAfkGrind then
+            if LocalPlayer:GetAttribute("InDungeon") then
+                pcall(function()
+                    local foundAny = false
+                    for _, d in ipairs(Workspace:GetDescendants()) do
+                        if d:IsA("ProximityPrompt") and d.Enabled then
+                            local model = d:FindFirstAncestorOfClass("Model")
+                            local name = model and model.Name or ""
+                            if (autoLootRoomChests and (name:find("DungeonChest") or d.Name == "ChestPrompt"))
+                                or (autoLootBossChests and name:find("BossLootChest"))
+                                or (autoClaimAltars and name:find("Blessing_Altar"))
+                                or (autoRefillPotions and name:find("Potion_Station"))
+                                or (autoUnlockDoors and (name:find("Locked_") or d.ActionText:find("Key"))) then
+                                foundAny = true
+                                break
+                            end
+                        end
+                    end
+
+                    if foundAny then
+                        LootEverythingInDungeon(true)
+                    end
+                end)
+
+                -- Check if Chest_Selection GUI is stuck on screen
+                pcall(function()
+                    local cframe = LocalPlayer.PlayerGui.Main.HUD:FindFirstChild("Chest_Selection")
+                    if cframe and cframe.Visible then
+                        ClaimMidRunChestsInternal(false)
+                        ClaimEndChestsInternal(false)
+                    end
+                end)
+            end
+        end
+        task.wait(1.5)
+    end
+end)
+
+-- Solo queue loop (when in lobby and standalone auto queue enabled)
+task.spawn(function()
+    while not HUB.dead do
+        if autoSoloQueue and not autoDungeonAfkGrind and not LocalPlayer:GetAttribute("InDungeon") then
+            StartSoloDungeon(selectedDungeon, selectedDifficulty)
+            task.wait(5)
+        end
+        task.wait(2)
+    end
+end)
+
+-- Standalone Mob Teleport loop
+task.spawn(function()
+    while not HUB.dead do
+        if autoNextMobTeleport and not autoDungeonAfkGrind and LocalPlayer:GetAttribute("InDungeon") then
+            local target = GetClosestTarget("Target Nearest", 2500)
+            if target and target.Pos then
+                local hrp = GetHRP()
+                -- TWEAK (Harta): hover 14 tengkurap, konsisten dengan AFK grinder
+                if hrp and (target.Pos - hrp.Position).Magnitude > 14 then
+                    hrp.CFrame = CFrame.lookAt(target.Pos + Vector3.new(0, 14, 0), target.Pos) * CFrame.Angles(math.rad(90), 0, 0)
+                end
+            end
         end
         task.wait(0.5)
     end
 end)
 
-print("[HK] farm v4 aktif (semua OFF)")
-
-
--- Harta Karun Dungeon | Auto Spin + live preview (gacha SummoningService)
--- Aman: hanya memutar ke slot DUMP yang tidak di-lock. Slot 1 & 2 WAJIB
--- locked, kalau tidak loop berhenti sendiri. Dapat Exotic -> kunci + stop.
--- Rate: Normal Exotic 0.05% | Lucky Exotic 0.1% (pity Exotic 500).
-
--- Harta Karun Dungeon | Auto Spin + live preview (gacha SummoningService)
--- Aman: hanya memutar ke slot DUMP yang tidak di-lock. Slot lain WAJIB
--- locked, kalau tidak loop berhenti sendiri. Dapat target -> kunci + stop.
--- Rate: Normal Exotic 0.05% | Lucky Exotic 0.1% (pity Exotic 500).
--- Dipakai oleh UI-Obsidian (tab Summon) dan overlay HK_Spin.
--- Guard generasi: reload file menaikkan gen, loop lama ikut mati.
-
-_G.HKSpinGen = (_G.HKSpinGen or 0) + 1
-local GEN = _G.HKSpinGen
-
-_G.HKSpin = {
-    on = false,
-    mode = "LuckyFirst", -- "LuckyFirst" | "Lucky" | "Normal"
-    delay = 1.2,
-    targetRarity = "Exotic", -- berhenti saat rarity >= ini
-    targetClass = "",        -- berhenti saat nama class cocok ("" = abaikan)
-    dumpSlot = 3,
-    log = {},
-    counts = {},
-    sessionRolls = 0,
-}
-
-_G.HKSpinRank = { Rare = 1, Epic = 2, Legendary = 3, Mythic = 4, Celestial = 5, Exotic = 6 }
-
--- Catatan: tidak ada overlay sendiri. Kontrol lewat tab Summon di UI
--- Obsidian (slot dump, mode, target rarity/class, START/STOP, status).
--- Overlay lama HK_Spin sengaja tidak dibuat lagi.
-
-local RAR = { Rare = "R", Epic = "E", Legendary = "L", Mythic = "M", Celestial = "C", Exotic = "X" }
-
+-- Economy Worker Loop
 task.spawn(function()
-    local function getRF(s, n)
-        local ok, rf = pcall(function()
-            return game.ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"]
-                .knit.Services[s].RF[n]
-        end)
-        if ok then
-            return rf
+    while not HUB.dead do
+        if autoCollectDrops then pcall(CollectDropsNearby) end
+        if autoCollectFloorGear then pcall(CollectAllFloorGear) end
+        if autoClaimAchievements then pcall(ClaimAllAchievements) end
+        if autoClaimQuests then pcall(ClaimAllQuests) end
+        if autoFreeChest then pcall(ClaimFreeChest) end
+        if autoSellLootStorage then pcall(SellAllLoot) end
+        if autoAllocateStats and autoAllocateStatChoice ~= "None" then
+            pcall(function() AllocateStatPoints(autoAllocateStatChoice) end)
         end
-    end
-    local spin, gd, sc, tl = nil, nil, nil, nil
-    local function refresh()
-        -- Ditampilkan lewat label status di tab Summon (UI Obsidian).
-        -- Riwayat lengkap tetap di _G.HKSpin.log.
-        if _G.HKLib and not _G.HKLib.Unloaded then
-            pcall(function()
-                local last = "belum putar"
-                if #_G.HKSpin.log > 0 then last = _G.HKSpin.log[#_G.HKSpin.log] end
-                _G.HKLib.Options.HKSpinStatus:SetText(
-                    "roll:" .. tostring(_G.HKSpin.sessionRolls) .. " | " .. tostring(last))
-            end)
-        end
-    end
-    refresh()
-    while GEN == _G.HKSpinGen do
-        if spin == nil then
-            spin = getRF("SummoningService", "Spin")
-            gd = getRF("SummoningService", "GetSlotData")
-            sc = getRF("SummoningService", "GetSpinCounts")
-            tl = getRF("SummoningService", "ToggleSlotLock")
-        end
-        if _G.HKSpin.on and spin and gd then
-            local okAll, err = pcall(function()
-                local _, slots = pcall(function() return gd:InvokeServer() end)
-                if type(slots) ~= "table" then error("slot?") end
-                local ds = _G.HKSpin.dumpSlot
-                if slots.Slots[ds] == nil then error("slot " .. tostring(ds) .. " tidak ada") end
-                for i in ipairs(slots.Slots) do
-                    if i ~= ds and slots.SlotLocks[i] ~= true then
-                        error("slot " .. tostring(i) .. " tidak locked!")
-                    end
-                end
-                if slots.SlotLocks[ds] ~= false then
-                    error("slot dump sudah locked (dapat bagus?)")
-                end
-                if slots.ActiveIndex ~= _G.HKSpin.dumpSlot then
-                    local sw = getRF("SummoningService", "SwitchSlot")
-                    if not sw then error("no switch") end
-                    sw:InvokeServer(_G.HKSpin.dumpSlot)
-                end
-                local _, cnt = pcall(function() return sc:InvokeServer() end)
-                local st = _G.HKSpin.mode
-                if st == "LuckyFirst" then
-                    st = (cnt and cnt.Lucky or 0) > 0 and "Lucky" or "Normal"
-                end
-                if cnt and (cnt[st] or 0) <= 0 then error(st .. " habis") end
-                local res = spin:InvokeServer(st)
-                if type(res) ~= "table" then error("spin?") end
-                _G.HKSpin.sessionRolls += 1
-                local rar = tostring(res.Rarity)
-                local cls = tostring(res.ClassName)
-                _G.HKSpin.counts[rar] = (_G.HKSpin.counts[rar] or 0) + 1
-                table.insert(_G.HKSpin.log,
-                    "[" .. (RAR[rar] or "?") .. "] " .. st:sub(1, 1) .. ":"
-                    .. rar .. " " .. cls)
-                local want = _G.HKSpin.targetClass or ""
-                local hitClass = want ~= "" and string.lower(cls) == string.lower(want)
-                local hitRar = (_G.HKSpinRank[rar] or 0)
-                    >= (_G.HKSpinRank[_G.HKSpin.targetRarity] or 6)
-                if hitClass or hitRar then
-                    if tl then pcall(function() tl:InvokeServer(ds) end) end
-                    table.insert(_G.HKSpin.log,
-                        "TARGET: " .. cls .. " (" .. rar .. ") dikunci.")
-                    _G.HKSpin.on = false
-                end
-                refresh()
-            end)
-            if not okAll then
-                table.insert(_G.HKSpin.log, "STOP: " .. tostring(err):sub(1, 60))
-                _G.HKSpin.on = false
-                refresh()
-            end
-        end
-        task.wait(_G.HKSpin.delay)
+        if autoSpinEnabled then pcall(function() SpinClass(autoSpinType) end) end
+        task.wait(1.5)
     end
 end)
 
-print("[HK] spin siap")
-
-
--- Harta Karun Dungeon | Full-auto dungeon loop
--- LOBBY -> queue solo -> farm (sistem hover) -> complete (klaim sebisanya)
--- -> replay -> ulangi. Semua panggilan berisiko di-pcall, server mengabaikan
--- yang tidak valid. Default MATI, nyalakan dari tab Misc.
--- _G.HKAuto = { on=false, dungeon="Bandits Den", diff="Normal" }
-
-_G.HKAuto = _G.HKAuto or { on = false, dungeon = "Bandits Den", diff = "Normal" }
-_G.HKAuto.replay = false
-_G.HKAutoPick = _G.HKAutoPick == nil and true or _G.HKAutoPick
-
--- Auto replay: habis run selesai (event DungeonComplete), vote replay
--- berulang sampai sesi baru muncul (maks 60 dtk), lalu farm lanjut.
-task.spawn(function()
-    local svc = game.ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"].knit.Services
-    local function getRF(s, n)
-        local ok, rf = pcall(function()
-            return svc[s].RF[n]
-        end)
-        if ok then
-            return rf
-        end
-    end
-    local function sessionAlive()
-        local rf = getRF("DungeonRunService", "GetSessionInfo")
-        if not rf then
-            return false
-        end
-        local ok, s = pcall(function() return rf:InvokeServer() end)
-        return ok and type(s) == "table" and s.LocationId ~= nil
-    end
-    local function doReplay()
-        local rf = getRF("DungeonRunService", "RequestReplay")
-        if not rf then
-            return
-        end
-        for i = 1, 12 do
-            if sessionAlive() then
-                break
-            end
-            pcall(function() rf:InvokeServer() end)
-            task.wait(5)
-        end
-    end
-    local ok, re = pcall(function() return svc.DungeonRunService.RE.DungeonComplete end)
-    if ok and re then
-        pcall(function()
-            re.OnClientEvent:Connect(function()
-                if _G.HKAuto.replay then
-                    task.spawn(doReplay)
-                end
-            end)
-        end)
-    end
-    _G.HKDoReplay = doReplay
-    -- Watcher cadangan: kalau fase non-Combat bertahan 30 dtk (event
-    -- complete tidak datang), paksa replay. Reset tiap sesi Combat.
-    task.spawn(function()
-        local idle = 0
-        while true do
-            if _G.HKAuto and _G.HKAuto.replay then
-                local rf = getRF("DungeonRunService", "GetSessionInfo")
-                if rf then
-                    local ok, s = pcall(function() return rf:InvokeServer() end)
-                    if ok and type(s) == "table" and s.LocationId ~= nil then
-                        if tostring(s.Phase) ~= "Combat" then
-                            idle += 1
-                            if idle >= 3 then
-                                pcall(doReplay)
-                                idle = -12
-                            end
-                        else
-                            idle = 0
-                        end
-                    end
-                end
-            end
-            task.wait(10)
-        end
-    end)
-end)
-
--- Status run (read-only, untuk label): lobby / farming / done.
-task.spawn(function()
-    local function getRF(s, n)
-        local ok, rf = pcall(function()
-            return game.ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"]
-                .knit.Services[s].RF[n]
-        end)
-        if ok then return rf end
-    end
-    local sessRF = nil
-    while true do
-        if sessRF == nil then
-            sessRF = getRF("DungeonRunService", "GetSessionInfo")
-        end
-        if sessRF then
-            pcall(function()
-                local ok, s = pcall(function() return sessRF:InvokeServer() end)
-                if ok and type(s) == "table" and s.LocationId ~= nil then
-                    _G.HKAuto.state = tostring(s.Phase) .. " " .. tostring(s.MobsRemaining)
-                else
-                    _G.HKAuto.state = "lobby"
-                end
-            end)
-        end
-        task.wait(10)
-    end
-end)
-
-print("[HK] auto dungeon siap (mati default)")
-
--- Auto-TAP UI: menekan tombol popup (berkah/chest/replay) lewat sentuhan
--- virtual. Cara kerja: snapshot rung HUD, saat event datang cari frame
--- BARU yang muncul berisi tombol, tap tombol tengah, verifikasi ketutup.
--- Toggle: _G.HKTap (default true).
-_G.HKTap = _G.HKTap == nil and true or _G.HKTap
-task.spawn(function()
-    local P = game.Players.LocalPlayer
-    local VIM = nil
-    pcall(function() VIM = game:GetService("VirtualInputManager") end)
-    local function tapGui(btn)
-        if not (VIM and btn and btn:IsA("GuiObject")) then
-            return false
-        end
-        local ok = pcall(function()
-            local c = btn.AbsolutePosition + btn.AbsoluteSize / 2
-            local v2 = Vector2.new(c.X, c.Y)
-            VIM:SendTouchEvent(0, Enum.UserInputState.Begin, v2, game)
-            task.wait(0.08)
-            VIM:SendTouchEvent(0, Enum.UserInputState.End, v2, game)
-        end)
-        return ok
-    end
-    local function snapshot()
-        local s = {}
-        pcall(function()
-            for _, d in ipairs(P.PlayerGui.Main.HUD:GetDescendants()) do
-                if d:IsA("GuiObject") and d.Visible
-                    and (d:IsA("TextButton") or d:IsA("ImageButton")) then
-                    s[d:GetFullName()] = true
-                end
-            end
-        end)
-        return s
-    end
-    local function findCards()
-        local found = {}
-        pcall(function()
-            for _, d in ipairs(P.PlayerGui.Main.HUD:GetDescendants()) do
-                if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible then
-                    local fp = d:GetFullName()
-                    if not string.find(fp, "HK") then
-                        table.insert(found, d)
-                    end
-                end
-            end
-        end)
-        return found
-    end
-    _G.HKTapUI = {
-        tap = tapGui,
-        cards = findCards,
-        snap = snapshot,
-    }
-    local svc = game.ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"].knit.Services
-    -- Boss chest: tap Chest_1, Chest_2, lalu Selesai/Finish.
-    local function autoChestButtons()
-        local P2 = game.Players.LocalPlayer
-        local cs = P2.PlayerGui.Main.HUD:FindFirstChild("Chest_Selection")
-        if not (cs and cs.Visible) then
-            return false
-        end
-        for _, n in ipairs({ "Chest_1", "Chest_2" }) do
-            local b = cs:FindFirstChild(n)
-            if b then
-                tapGui(b)
-                task.wait(0.8)
-            end
-        end
-        task.wait(1)
-        for _, d in ipairs(cs:GetDescendants()) do
-            if d:IsA("GuiButton") and d.Visible then
-                local t = ""
-                if d:IsA("TextButton") then
-                    t = tostring(d.Text)
-                end
-                if string.find(string.lower(t), "selesai")
-                    or string.find(string.lower(d.Name), "finish") then
-                    tapGui(d)
-                    break
-                end
-            end
-        end
-        return true
-    end
-    _G.HKChestTap = autoChestButtons
-    -- Replay: tap PUTAR ULANG di layar extracted.
-    local function autoReplayTap()
-        local P2 = game.Players.LocalPlayer
-        for _, d in ipairs(P2.PlayerGui:GetDescendants()) do
-            if d:IsA("ImageButton") and d.Visible then
-                local has = false
-                pcall(function()
-                    for _, c in ipairs(d:GetDescendants()) do
-                        if c:IsA("TextLabel")
-                            and string.find(string.upper(tostring(c.Text)), "PUTAR ULANG") then
-                            has = true
-                            break
-                        end
-                    end
-                end)
-                if has then
-                    tapGui(d)
-                    return true
-                end
-            end
-        end
-        return false
-    end
-    _G.HKReplayTap = autoReplayTap
-    -- Watcher: tiap 2 detik cek popup chest / replay, tap otomatis.
-    task.spawn(function()
-        while true do
-            if _G.HKTap then
-                pcall(function()
-                    local P2 = game.Players.LocalPlayer
-                    local cs = P2.PlayerGui.Main.HUD:FindFirstChild("Chest_Selection")
-                    if cs and cs.Visible then
-                        autoChestButtons()
-                    elseif _G.HKAuto.replay then
-                        autoReplayTap()
-                    end
-                end)
-            end
-            task.wait(2)
-        end
-    end)
-end)
-
--- Auto-pick: altar berkah pilih acak, hadiah boss/mid-run ambil semua.
--- Mendengarkan event server -> client (tanpa hook), lalu jawab RF-nya.
-task.spawn(function()
-    local svc = game.ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"].knit.Services
-    local function rf(sname, fname)
-        local ok, r = pcall(function() return svc[sname].RF[fname] end)
-        if ok then
-            return r
-        end
-    end
-    local function findOptions(t)
-        if type(t) ~= "table" then
-            return nil
-        end
-        local n, arr = 0, true
-        for k, v in pairs(t) do
-            n += 1
-            if type(k) ~= "number" or type(v) ~= "table" then
-                arr = false
-            end
-        end
-        if arr and n > 0 then
-            return t
-        end
-        for _, v in pairs(t) do
-            if type(v) == "table" then
-                local r = findOptions(v)
-                if r then
-                    return r
-                end
-            end
-        end
-        return nil
-    end
-    local function optId(opt)
-        for _, k in ipairs({ "Id", "ID", "Index", "Name", "BuffId", "ChestId", "Key" }) do
-            if opt[k] ~= nil and type(opt[k]) ~= "table" then
-                return opt[k]
-            end
-        end
-        return nil
-    end
-    local function hookPick(sname, ename, rfName, multi)
-        local ok, re = pcall(function() return svc[sname].RE[ename] end)
-        if not (ok and re) then
-            return
-        end
-        pcall(function()
-            re.OnClientEvent:Connect(function(...)
-                local args = { ... }
-                _G.HKSnoop = _G.HKSnoop or {}
-                if not _G.HKAutoPick then
-                    return
-                end
-                local opts = nil
-                for _, a in ipairs(args) do
-                    opts = findOptions(a)
-                    if opts then
-                        break
-                    end
-                end
-                if not opts then
-                    return
-                end
-                local ids = {}
-                for _, o in ipairs(opts) do
-                    local id = optId(o)
-                    if id ~= nil then
-                        table.insert(ids, id)
-                    end
-                end
-                if #ids == 0 then
-                    return
-                end
-                task.wait(1)
-                local rfn = rf(sname, rfName)
-                if rfn then
-                    if multi then
-                        pcall(function() rfn:InvokeServer(ids) end)
-                    else
-                        pcall(function() rfn:InvokeServer(ids[math.random(1, #ids)]) end)
-                    end
-                end
-            end)
-        end)
-    end
-    -- Buff altar: saat event BuffSelection datang, cari UI pilihannya,
-    -- kumpulkan tombol opsi, coba SelectBuff dengan tiap varian
-    -- (id atribut / index / nama) sampai UI ketutup. Semua dicatat.
-    _G.HKBuffLog = _G.HKBuffLog or {}
-    do
-        local ok, re = pcall(function() return svc.DungeonBuffService.RE.BuffSelection end)
-        if ok and re then
-            pcall(function()
-                re.OnClientEvent:Connect(function(...)
-                    local args = { ... }
-                    table.insert(_G.HKBuffLog, "event datang, nargs=" .. tostring(#args))
-                    if not _G.HKAutoPick then
-                        return
-                    end
-                    task.spawn(function()
-                        task.wait(1.5)
-                        local P = game.Players.LocalPlayer
-                        local btns = {}
-                        pcall(function()
-                            for _, d in ipairs(P.PlayerGui:GetDescendants()) do
-                                if (d:IsA("TextButton") or d:IsA("ImageButton"))
-                                    and d.Visible then
-                                    local fp = d:GetFullName()
-                                    if string.find(fp, "Buff") and not string.find(fp, "HK") then
-                                        local txt = ""
-                                        if d:IsA("TextButton") then
-                                            txt = tostring(d.Text)
-                                        end
-                                        local idv = nil
-                                        pcall(function()
-                                            for ak, av in pairs(d:GetAttributes()) do
-                                                if type(av) ~= "table" and idv == nil then
-                                                    idv = av
-                                                end
-                                            end
-                                        end)
-                                        table.insert(btns, { b = d, txt = txt, attr = idv })
-                                    end
-                                end
-                            end
-                        end)
-                        table.insert(_G.HKBuffLog, "tombol buff: " .. tostring(#btns))
-                        -- Cara 1 (utama): cari judul PILIH BERKAT, tap kartu tengah.
-                        local tapped = false
-                        pcall(function()
-                            local P2 = game.Players.LocalPlayer
-                            for _, d in ipairs(P2.PlayerGui:GetDescendants()) do
-                                if d:IsA("TextLabel") and d.Visible
-                                    and string.find(string.upper(tostring(d.Text)), "BERKAT") then
-                                    local box = d.Parent
-                                    while box and box.Parent ~= P2.PlayerGui do
-                                        local cards = {}
-                                        for _, c in ipairs(box:GetDescendants()) do
-                                            if (c:IsA("TextButton") or c:IsA("ImageButton"))
-                                                and c.Visible then
-                                                table.insert(cards, c)
-                                            end
-                                        end
-                                        if #cards >= 2 then
-                                            local mid = cards[math.floor(#cards / 2) + 1]
-                                            if _G.HKTapUI then
-                                                _G.HKTapUI.tap(mid)
-                                            end
-                                            tapped = true
-                                            break
-                                        end
-                                        box = box.Parent
-                                    end
-                                    if tapped then
-                                        break
-                                    end
-                                end
-                            end
-                        end)
-                        task.wait(1.5)
-                        local stillOpen = false
-                        pcall(function()
-                            local P2 = game.Players.LocalPlayer
-                            for _, d in ipairs(P2.PlayerGui:GetDescendants()) do
-                                if d:IsA("TextLabel") and d.Visible
-                                    and string.find(string.upper(tostring(d.Text)), "BERKAT") then
-                                    stillOpen = true
-                                    break
-                                end
-                            end
-                        end)
-                        if tapped and not stillOpen then
-                            table.insert(_G.HKBuffLog, "OK via tap kartu")
-                            return
-                        end
-                        if #btns == 0 then
-                            return
-                        end
-                        local rfn = rf("DungeonBuffService", "SelectBuff")
-                        if not rfn then
-                            return
-                        end
-                        local order = {}
-                        for i = 1, #btns do
-                            table.insert(order, i)
-                        end
-                        for i = #order, 2, -1 do
-                            local j = math.random(1, i)
-                            order[i], order[j] = order[j], order[i]
-                        end
-                        for _, oi in ipairs(order) do
-                            local o = btns[oi]
-                            local tries = {}
-                            if o.attr ~= nil then
-                                table.insert(tries, o.attr)
-                            end
-                            table.insert(tries, oi)
-                            if o.txt ~= "" then
-                                table.insert(tries, o.txt)
-                            end
-                            for _, v in ipairs(tries) do
-                                pcall(function() rfn:InvokeServer(v) end)
-                                task.wait(1)
-                                local closed = true
-                                pcall(function()
-                                    for _, d in ipairs(P.PlayerGui:GetDescendants()) do
-                                        if (d:IsA("TextButton") or d:IsA("ImageButton"))
-                                            and d.Visible then
-                                            local fp = d:GetFullName()
-                                            if string.find(fp, "Buff") and not string.find(fp, "HK") then
-                                                closed = false
-                                                break
-                                            end
-                                        end
-                                    end
-                                end)
-                                if closed then
-                                    table.insert(_G.HKBuffLog, "OK pakai " .. tostring(v))
-                                    return
-                                end
-                            end
-                        end
-                        table.insert(_G.HKBuffLog, "GAGAL semua varian")
-                    end)
-                end)
-            end)
-        end
-    end
-    -- Chest boss/mid-run: JANGAN tebak ID Ã¢â‚¬â€ baca jumlah dari UI
-    -- ("SELECT N CHESTS") lalu panggil SelectChests({1..N}).
-    -- Terbukti live: SelectChests({1,2}) -> true + UI ketutup.
-    local function autoChestUI()
-        local P = game.Players.LocalPlayer
-        for i = 1, 20 do
-            local done = false
-            pcall(function()
-                local cs = P.PlayerGui.Main.HUD:FindFirstChild("Chest_Selection")
-                if cs and cs.Visible then
-                    local n = 2
-                    for _, d in ipairs(cs:GetDescendants()) do
-                        if d:IsA("TextLabel") then
-                            local c = string.match(tostring(d.Text), "SELECT (%d+)")
-                            if c then
-                                n = tonumber(c)
-                                break
-                            end
-                        end
-                    end
-                    local ids = {}
-                    for k = 1, n do
-                        table.insert(ids, k)
-                    end
-                    local rf = rfn("DungeonRunService", "SelectChests")
-                    if rf then
-                        pcall(function() rf:InvokeServer(ids) end)
-                    end
-                    local rf2 = rfn2("DungeonRunService", "SelectMidRunChests")
-                    if rf2 then
-                        pcall(function() rf2:InvokeServer(ids) end)
-                    end
-                    task.wait(1)
-                    local cs2 = P.PlayerGui.Main.HUD:FindFirstChild("Chest_Selection")
-                    if not cs2 or not cs2.Visible then
-                        done = true
-                    end
-                else
-                    done = true
-                end
-            end)
-            if done then
-                break
-            end
-            task.wait(1)
-        end
-    end
-    local function rfn(sname, fname)
-        local ok, r = pcall(function()
-            return svc[sname].RF[fname]
-        end)
-        if ok then
-            return r
-        end
-    end
-    local function rfn2(sname, fname)
-        return rfn(sname, fname)
-    end
-    task.spawn(function()
-        while true do
-            if _G.HKAutoPick then
-                pcall(function()
-                    local cs = game.Players.LocalPlayer.PlayerGui.Main.HUD
-                        :FindFirstChild("Chest_Selection")
-                    if cs and cs.Visible then
-                        autoChestUI()
-                    end
-                end)
-            end
-            task.wait(3)
-        end
-    end)
-end)
-
-
--- Harta Karun Dungeon | UI Obsidian (mstudio45/deividcomsono fork)
--- Butuh _G.HK dari Farm.lua (jalan dulu) Ã¢â‚¬â€ kalau belum ada, dibuatkan default.
--- Buka/tutup menu: RightShift.
-
-pcall(function()
-    game.Players.LocalPlayer.PlayerGui:FindFirstChild("HK_UI"):Destroy()
-end)
-if _G.HKLib then
-    pcall(function() _G.HKLib:Unload() end)
-    _G.HKLib = nil
-end
-
-_G.HK.hover = false
-_G.HK.atk = false
-_G.HK.skill = false
-_G.HK.esp = false
-_G.HK.loot = false
-_G.HK.chest = false
-_G.HK.stealth = false
-_G.HK.infjump = false
-_G.HK.height = _G.HK.height or 6.5
-_G.HK.rate = _G.HK.rate or 0.25
-_G.HK.atkRange = _G.HK.atkRange or 15
-_G.HK.speed = _G.HK.speed or 32
-_G.HK.flyspeed = _G.HK.flyspeed or 60
-_G.HK.noclip = false
-_G.HK.fly = false
-
-_G.HKSpin = _G.HKSpin or {
-    on = false, mode = "LuckyFirst", delay = 1.2,
-    targetRarity = "Exotic", targetClass = "", dumpSlot = 3,
-    log = {}, counts = {}, sessionRolls = 0,
-}
-_G.HKSpinRank = _G.HKSpinRank or
-    { Rare = 1, Epic = 2, Legendary = 3, Mythic = 4, Celestial = 5, Exotic = 6 }
-
-_G.HKAuto = _G.HKAuto or { on = false, dungeon = "Bandits Den", diff = "Normal" }
-
-local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
-local lib = loadstring(game:HttpGet(repo .. "Library.lua"))()
-_G.HKLib = lib
-
-local Window = lib:CreateWindow({
-    Title = "Harta Karun Hub",
-    Footer = "dungeon farm",
-    NotifySide = "Right",
-    ShowCustomCursor = true,
-})
-
--- ===== TAB FARM =====
-local FarmTab = Window:AddTab("Farm", "swords")
-local FarmL = FarmTab:AddLeftGroupbox("Hover Farm")
-FarmL:AddToggle("HKAutoFarm", {
-    Text = "AUTO FARM (semua)",
-    Default = _G.HK.autoFarm == true,
-    Callback = function(v)
-        _G.HK.autoFarm = v
-        for _, k in ipairs({ "atk", "skill", "esp", "loot", "chest", "stealth", "dropLoot", "autoHeal" }) do
-            _G.HK[k] = v
-        end
-        _G.HK.hx = v
-        _G.HK.hover = false
-        if v then
-            _G.HK.goAltar = true
-        end
-    end,
-})
-FarmL:AddToggle("HKHover", {
-    Text = "Hover di atas bandit",
-    Default = _G.HK.hx == true,
-    Callback = function(v)
-        _G.HK.hx = v
-        _G.HK.hover = false
-    end,
-})
-FarmL:AddSlider("HKHeight", {
-    Text = "Tinggi hover",
-    Default = math.min(_G.HK.height, 30), Min = 4, Max = 30, Rounding = 1,
-    Callback = function(v) _G.HK.height = v end,
-})
-FarmL:AddToggle("HKChest", {
-    Text = "Auto loot chest",
-    Default = _G.HK.chest,
-    Callback = function(v) _G.HK.chest = v end,
-})
-FarmL:AddToggle("HKWaveNav", {
-    Text = "Navigasi wave belum selesai",
-    Default = _G.HKWaveNav ~= false,
-    Callback = function(v) _G.HKWaveNav = v end,
-})
-FarmL:AddButton({
-    Text = "Mulai: Altar dulu, baru Gate 1",
-    Func = function()
-        task.spawn(function()
-            pcall(function()
-                local P = game.Players.LocalPlayer
-                local hrp = P.Character and P.Character:FindFirstChild("HumanoidRootPart")
-                local gen = nil
-                for _, c in ipairs(workspace:GetChildren()) do
-                    if string.find(c.Name, "Generated") then
-                        gen = c
-                        break
-                    end
-                end
-                if gen and hrp then
-                    local best, bd, bpr = nil, 1e9, nil
-                    for _, d in ipairs(gen:GetDescendants()) do
-                        if d:IsA("ProximityPrompt") and d.Enabled
-                            and string.find(string.lower(d.ActionText), "bless") then
-                            local m = d.Parent
-                            while m and not m:IsA("Model") do
-                                m = m.Parent
-                            end
-                            if m then
-                                local ok, piv = pcall(function() return m:GetPivot() end)
-                                if ok then
-                                    local dist = (piv.Position - hrp.Position).Magnitude
-                                    if dist < bd then
-                                        best, bd, bpr = m, dist, d
-                                    end
-                                end
-                            end
-                        end
-                    end
-                    if best and bpr then
-                        local piv = best:GetPivot()
-                        hrp.CFrame = CFrame.new(piv.X, piv.Y + 4, piv.Z + 2)
-                        hrp.Velocity = Vector3.new()
-                        task.wait(0.7)
-                        pcall(function() fireproximityprompt(bpr) end)
-                        task.wait(1.5)
-                    end
-                    local r1 = gen:FindFirstChild("Room_1")
-                    if r1 and r1:IsA("Model") then
-                        local piv = r1:GetPivot()
-                        hrp.CFrame = CFrame.new(piv.X, piv.Y + 5, piv.Z)
-                        hrp.Velocity = Vector3.new()
-                    end
-                end
-                _G.HKZone.room = 1
-                _G.HKZone.lastRoom = 1
-                _G.HK.hover = true
-                _G.HK.atk = true
-            end)
-        end)
-    end,
-})
-FarmL:AddToggle("HKDrop", {
-    Text = "Auto loot drop monster",
-    Default = _G.HK.dropLoot == true,
-    Callback = function(v) _G.HK.dropLoot = v end,
-})
-
--- ===== TAB COMBAT =====
-local CombatTab = Window:AddTab("Combat", "zap")
-local C = CombatTab:AddLeftGroupbox("Auto Serang")
-C:AddToggle("HKAtk", {
-    Text = "Spam basic attack",
-    Default = _G.HK.atk,
-    Callback = function(v) _G.HK.atk = v end,
-})
-C:AddToggle("HKSkill", {
-    Text = "Auto skill (tombol 1-4)",
-    Default = _G.HK.skill,
-    Callback = function(v) _G.HK.skill = v end,
-})
-C:AddToggle("HKHeal", {
-    Text = "Auto heal (tombol 5, HP<40%)",
-    Default = _G.HK.autoHeal == true,
-    Callback = function(v) _G.HK.autoHeal = v end,
-})
-C:AddSlider("HKAtkRange", {
-    Text = "Jarak serang",
-    Default = _G.HK.atkRange or 15, Min = 5, Max = 40, Rounding = 0, Suffix = "st",
-    Callback = function(v) _G.HK.atkRange = v end,
-})
-local C2 = CombatTab:AddLeftGroupbox("Kecepatan")
-C2:AddSlider("HKRate", {
-    Text = "Jeda attack",
-    Default = _G.HK.rate, Min = 0.1, Max = 1, Rounding = 2, Suffix = "s",
-    Callback = function(v) _G.HK.rate = v end,
-})
-local C3 = CombatTab:AddLeftGroupbox("Stealth")
-C3:AddToggle("HKStealth", {
-    Text = "Serang tanpa animasi",
-    Default = _G.HK.stealth,
-    Callback = function(v) _G.HK.stealth = v end,
-})
-
--- ===== TAB VISUAL =====
-local VisualTab = Window:AddTab("Visual", "eye")
-local V = VisualTab:AddLeftGroupbox("ESP dan Loot")
-V:AddToggle("HKEsp", {
-    Text = "ESP nama + HP mob",
-    Default = _G.HK.esp,
-    Callback = function(v)
-        _G.HK.esp = v
-        if not v then
-            for _, d in ipairs(workspace:GetDescendants()) do
-                if d.Name == "HK_ESP" then
-                    pcall(function() d:Destroy() end)
-                end
-            end
-        end
-    end,
-})
-V:AddToggle("HKLoot", {
-    Text = "Auto loot chest dekat",
-    Default = _G.HK.loot,
-    Callback = function(v) _G.HK.loot = v end,
-})
-V:AddButton({
-    Text = "Bersihkan semua ESP",
-    Func = function()
-        for _, d in ipairs(workspace:GetDescendants()) do
-            if d.Name == "HK_ESP" then
-                pcall(function() d:Destroy() end)
-            end
-        end
-    end,
-})
-
--- ===== TAB MOVEMENT =====
-local MoveTab = Window:AddTab("Movement", "move")
-local M = MoveTab:AddLeftGroupbox("Gerak")
-M:AddToggle("HKNoclip", {
-    Text = "Noclip",
-    Default = _G.HK.noclip,
-    Callback = function(v) _G.HK.noclip = v end,
-})
-M:AddToggle("HKInfJump", {
-    Text = "Infinite jump",
-    Default = _G.HK.infjump,
-    Callback = function(v) _G.HK.infjump = v end,
-})
-M:AddToggle("HKFly", {
-    Text = "Fly (WASD + Space/Ctrl)",
-    Default = _G.HK.fly,
-    Callback = function(v) _G.HK.fly = v end,
-})
-local M2 = MoveTab:AddRightGroupbox("Kecepatan")
-M2:AddSlider("HKSpd", {
-    Text = "Walk speed",
-    Default = _G.HK.speed, Min = 16, Max = 100, Rounding = 0,
-    Callback = function(v) _G.HK.speed = v end,
-})
-M2:AddSlider("HKFlySpd", {
-    Text = "Fly speed",
-    Default = _G.HK.flyspeed, Min = 20, Max = 150, Rounding = 0,
-    Callback = function(v) _G.HK.flyspeed = v end,
-})
-
--- ===== TAB MISC =====
-local MiscTab = Window:AddTab("Misc", "package")
-local B = MiscTab:AddLeftGroupbox("Aksi")
-B:AddButton({
-    Text = "Claim codes + free chest",
-    Func = function()
-        task.spawn(function()
-            for _, c in ipairs({ "TOURNAMENT", "20MVISIT", "JACKAL", "45KLIKE", "SILVERINE", "CC_UPDATE2" }) do
-                local ok, rf = pcall(function()
-                    return game.ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"]
-                        .knit.Services.CodesService.RF.RedeemCode
-                end)
-                if ok and rf then pcall(function() rf:InvokeServer(c) end) end
-                task.wait(0.3)
-            end
-            local ok2, rf2 = pcall(function()
-                return game.ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"]
-                    .knit.Services.ChestService.RF.ClaimFreeChest
-            end)
-            if ok2 and rf2 then pcall(function() rf2:InvokeServer() end) end
-            lib:Notify({ Title = "Claim", Description = "Selesai", Time = 3 })
-        end)
-    end,
-})
-B:AddButton({
-    Text = "STOP SEMUA",
-    Func = function()
-        _G.HK.hover = false
-        _G.HK.hx = false
-        _G.HK.atk = false
-        _G.HK.skill = false
-        _G.HK.loot = false
-        _G.HK.noclip = false
-        _G.HK.fly = false
-        _G.HKAuto.on = false
-        local hum = game.Players.LocalPlayer.Character
-            and game.Players.LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-        if hum then hum.AutoRotate = true end
-        lib:Notify({ Title = "Harta Karun", Description = "Semua fitur dimatikan", Time = 3 })
-    end,
-})
-local A = MiscTab:AddLeftGroupbox("Otomatis")
-A:AddToggle("HKAutoReplay", {
-    Text = "Auto replay dungeon sama",
-    Default = _G.HKAuto.replay ~= false,
-    Callback = function(v) _G.HKAuto.replay = v end,
-})
-A:AddLabel("status auto", true, "HKAutoStatus")
-A:AddToggle("HKAutoPick", {
-    Text = "Auto pick buff + chest",
-    Default = _G.HKAutoPick ~= false,
-    Callback = function(v) _G.HKAutoPick = v end,
-})
-A:AddToggle("HKTapUI", {
-    Text = "Auto tap popup (buff/chest/replay)",
-    Default = _G.HKTap ~= false,
-    Callback = function(v) _G.HKTap = v end,
-})
-
--- ===== TAB SUMMON =====
-local SummonTab = Window:AddTab("Summon", "dices")
-local S = SummonTab:AddLeftGroupbox("Auto Spin")
-S:AddSlider("HKSpinSlot", {
-    Text = "Slot tukar (dump)",
-    Default = _G.HKSpin.dumpSlot, Min = 1, Max = 6, Rounding = 0,
-    Callback = function(v) _G.HKSpin.dumpSlot = v end,
-})
-S:AddDropdown("HKSpinMode", {
-    Text = "Jenis putaran",
-    Values = { "LuckyFirst", "Lucky", "Normal" },
-    Default = 1,
-    Callback = function(v) _G.HKSpin.mode = v end,
-})
-S:AddDropdown("HKSpinTarget", {
-    Text = "Berhenti saat rarity >=", 
-    Values = { "Exotic", "Celestial", "Mythic", "Legendary" },
-    Default = 1,
-    Callback = function(v) _G.HKSpin.targetRarity = v end,
-})
-S:AddInput("HKSpinClass", {
-    Text = "Target class (kosong = semua)",
-    Default = "",
-    Finished = true,
-    Callback = function(v) _G.HKSpin.targetClass = v end,
-})
-S:AddButton({
-    Text = "START spin",
-    Func = function() _G.HKSpin.on = true end,
-})
-S:AddButton({
-    Text = "STOP spin",
-    Func = function() _G.HKSpin.on = false end,
-})
-S:AddLabel("status", true, "HKSpinStatus")
-
--- ===== TAB UI SETTINGS =====
-local UITab = Window:AddTab("UI Settings", "settings")
-local MG = UITab:AddLeftGroupbox("Menu")
-MG:AddLabel("Menu bind"):AddKeyPicker("MenuKeybind", {
-    Default = "RightShift",
-    NoUI = true,
-    Text = "Menu keybind",
-})
-MG:AddButton("Unload UI", function() lib:Unload() end)
-lib.ToggleKeybind = lib.Options.MenuKeybind
-
--- Watermark status target farm
-pcall(function()
-    lib:SetWatermarkVisibility(true)
-    lib:SetWatermark("farm: ...")
-end)
-task.spawn(function()
-    while not lib.Unloaded do
-        pcall(function()
-            lib:SetWatermark("farm: " .. tostring(_G.HK and _G.HK.target or "?"))
-            local last = "belum putar"
-            if _G.HKSpin and #_G.HKSpin.log > 0 then
-                last = _G.HKSpin.log[#_G.HKSpin.log]
-            end
-            lib.Options.HKSpinStatus:SetText(
-                "roll:" .. tostring(_G.HKSpin and _G.HKSpin.sessionRolls or 0)
-                .. " | " .. tostring(last))
-            pcall(function()
-                lib.Options.HKAutoStatus:SetText(
-                    "auto:" .. tostring(_G.HKAuto and _G.HKAuto.state or "-"))
-            end)
-        end)
-        task.wait(1)
-    end
-end)
-
-lib:Notify({
-    Title = "Harta Karun Hub",
-    Description = "Semua tab terpasang. RightShift = buka/tutup.",
-    Time = 5,
-})
-print("[HK] UI Obsidian aktif")
-
--- PATCH Harta.lua FINAL (gabungan v1+v2+v3 + perbaikan live)
--- Cara pasang: paste SELURUH blok ini di BARIS PALING AKHIR file Harta.lua,
--- Commit, lalu re-execute dari raw URL. Tidak perlu edit kode lama.
--- Isi: BlessPick 1/2/3 (ID-based) + poller 2 GUIs + altar-first kunci + chest global + zone-touch.
-
-_G.HKBlessPick = _G.HKBlessPick or 1   -- 1=kiri, 2=tengah, 3=kanan
-_G.HKAltarFirst = (_G.HKAltarFirst == nil) and true or _G.HKAltarFirst
-_G.HKChestReach = _G.HKChestReach or 3000
-
--- 1) Auto-pilih blessing via ID buff (hp_up/skill_crit_dmg/dmg_up/...),
---    fallback index mentah. Event + poller PlayerGui&CoreGui tiap 2 detik.
+-- ==============================================================================
+-- TWEAK (Harta): auto-pilih kartu berkat 1/2/3 (default 1 = kiri).
+-- Ganti live via: _G.HartaBlessPick = 2  (atau 3)
+-- Dikirim sebagai ID buff (hp_up/skill_crit_dmg/dmg_up/...) + fallback index.
+-- Termasuk poller cadangan tiap 2 detik (PlayerGui + CoreGui).
+-- ==============================================================================
+_G.HartaBlessPick = _G.HartaBlessPick or 1
 task.spawn(function()
     local ok, svc = pcall(function()
-        return game.ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"]
-            .knit.Services.DungeonBuffService
+        return ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"].knit.Services.DungeonBuffService
     end)
     if not ok or not svc then return end
     local function pickNow()
-        local pick = tonumber(_G.HKBlessPick) or 1
+        local pick = tonumber(_G.HartaBlessPick) or 1
         if pick < 1 or pick > 3 then pick = 1 end
         local id = nil
         pcall(function()
-            local opts = _G.HKLastBless and _G.HKLastBless[1]
+            local opts = _G.HartaLastBless and _G.HartaLastBless[1]
             if type(opts) == "table" and type(opts[pick]) == "table" and opts[pick].Id then
                 id = tostring(opts[pick].Id)
             end
@@ -1974,221 +1098,1204 @@ task.spawn(function()
         pcall(function() svc.RF.SelectBuff:InvokeServer(pick) end)
     end
     pcall(function()
-        if _G.BlessConn then pcall(function() _G.BlessConn:Disconnect() end) end
-        _G.BlessConn = svc.RE.BuffSelection.OnClientEvent:Connect(function(...)
-            _G.HKLastBless = { ... }
+        svc.RE.BuffSelection.OnClientEvent:Connect(function(...)
+            _G.HartaLastBless = { ... }
             task.wait(0.3)
             pickNow()
         end)
     end)
-    if _G.BlessPoll then pcall(function() _G.BlessPoll:Disconnect() end) end
-    _G.BlessPoll = game:GetService("RunService").Heartbeat:Connect(function()
-        local now = os.clock()
-        if _G._blessPollAt and now - _G._blessPollAt < 2 then return end
-        _G._blessPollAt = now
-        local found = false
-        for _, root in ipairs({ game.Players.LocalPlayer.PlayerGui, game:GetService("CoreGui") }) do
-            pcall(function()
+    while not HUB.dead do
+        pcall(function()
+            local found = false
+            for _, root in ipairs({ LocalPlayer.PlayerGui, game:GetService("CoreGui") }) do
                 for _, d in ipairs(root:GetDescendants()) do
                     if d:IsA("TextLabel") and d.Text == "PILIH BERKAT:" then found = true break end
                 end
-            end)
-            if found then break end
-        end
-        if found then pickNow() end
-    end)
-end)
-
--- 2) Tiap AUTO FARM ON / run baru: reset + kunci serang sampai altar pertama
-task.spawn(function()
-    local prevToggle, lastLoc, wasFull, lockUntil = nil, nil, false, 0
-    while true do
-        pcall(function()
-            local on = _G.HK and _G.HK.autoFarm
-            local loc, full = nil, false
-            local rf = game.ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"]
-                .knit.Services.DungeonRunService.RF.GetSessionInfo
-            local ok, s = pcall(function() return rf:InvokeServer() end)
-            if ok and type(s) == "table" then
-                loc = tostring(s.LocationId)
-                local rem, tot = tonumber(s.MobsRemaining), tonumber(s.TotalMobsInRoom)
-                if rem and tot and tot > 0 and rem >= tot then full = true end
+                if found then break end
             end
-            local newRun = full and (not wasFull or (loc ~= nil and loc ~= lastLoc))
-            local toggled = on and not prevToggle
-            if (newRun or toggled) and on and _G.HKAltarFirst then
-                _G.HKAltarDone = {}
-                _G.HKChestSkip = {}
-                if _G.HKZone then _G.HKZone.lastRoom = nil end
-                _G.HKLockSaved = { atk = _G.HK.atk, skill = _G.HK.skill, hx = _G.HK.hx }
-                _G.HK.atk = false
-                _G.HK.skill = false
-                _G.HK.hx = false
-                _G.HK.goAltar = true
-                lockUntil = os.clock() + 20
-            end
-            if loc ~= nil then lastLoc = loc end
-            wasFull = full
-            if prevToggle == nil then prevToggle = on end
-            if lockUntil > 0 and os.clock() > lockUntil then lockUntil = 0 end
-            local done = false
-            for _ in pairs(_G.HKAltarDone or {}) do done = true break end
-            if (done or lockUntil == 0) and _G.HKLockSaved then
-                _G.HK.atk = _G.HKLockSaved.atk
-                _G.HK.skill = _G.HKLockSaved.skill
-                _G.HK.hx = _G.HKLockSaved.hx
-                _G.HKLockSaved = nil
-                lockUntil = 0
-            end
-            prevToggle = on
+            if found then pickNow() end
         end)
-        task.wait(1)
-    end
-end)
-
--- 3) Prioritas altar mid-run sebelum chest/patrol (saat tidak ada target)
-task.spawn(function()
-    while true do
-        if _G.HK and _G.HK.autoFarm and _G.HKT == nil and _G.HKAltarFirst then
-            pcall(function()
-                local P = game.Players.LocalPlayer
-                local hrp = P.Character and P.Character:FindFirstChild("HumanoidRootPart")
-                if hrp then
-                    local best, bpr, bd = nil, nil, 1e9
-                    for _, d in ipairs(workspace:GetDescendants()) do
-                        if d:IsA("ProximityPrompt") and d.Enabled
-                            and string.find(string.lower(d.ActionText), "bless") then
-                            local m = d.Parent
-                            while m and not m:IsA("Model") do m = m.Parent end
-                            if m and not (_G.HKAltarDone or {})[m:GetFullName()] then
-                                local ok, piv = pcall(function() return m:GetPivot() end)
-                                if ok then
-                                    local dist = (piv.Position - hrp.Position).Magnitude
-                                    if dist < bd then best, bd, bpr = m, dist, d end
-                                end
-                            end
-                        end
-                    end
-                    if best and bpr then
-                        _G.HKAltarDone[best:GetFullName()] = true
-                        local piv = best:GetPivot()
-                        hrp.CFrame = CFrame.new(piv.X, piv.Y + 4, piv.Z + 2)
-                        hrp.Velocity = Vector3.new()
-                        task.wait(0.6)
-                        pcall(function() fireproximityprompt(bpr) end)
-                        task.wait(1.5)
-                    end
-                end
-            end)
-        end
         task.wait(2)
     end
 end)
 
--- 4) Chest fallback GLOBAL (s/d 3000 studs) saat room sendiri kosong
-task.spawn(function()
-    while true do
-        if _G.HK and _G.HK.autoFarm and _G.HK.chest and _G.HKT == nil then
-            pcall(function()
-                local P = game.Players.LocalPlayer
-                local hrp = P.Character and P.Character:FindFirstChild("HumanoidRootPart")
-                if hrp then
-                    local best, bpr, bd = nil, nil, 1e9
-                    for _, d in ipairs(workspace:GetDescendants()) do
-                        if d:IsA("ProximityPrompt") and d.Enabled and d.Name == "ChestPrompt"
-                            and d.HoldDuration == 0 then
-                            local m = d.Parent
-                            while m and not m:IsA("Model") do m = m.Parent end
-                            if m and (string.find(m.Name, "DungeonChest") or string.find(m.Name, "BossLoot")) then
-                                local part = d.Parent
-                                if part and part:IsA("Attachment") then part = part.Parent end
-                                local tp = nil
-                                if part and part:IsA("BasePart") then
-                                    tp = part.Position
-                                else
-                                    local ok, cf = pcall(function() return m:GetPivot() end)
-                                    if ok then tp = cf.Position end
-                                end
-                                if tp then
-                                    local dist = (tp - hrp.Position).Magnitude
-                                    if dist < bd and dist <= (_G.HKChestReach or 3000) then
-                                        best, bpr, bd = tp, d, dist
-                                    end
-                                end
-                            end
-                        end
-                    end
-                    if best and bpr and bd > 60 then
-                        hrp.CFrame = CFrame.new(best + Vector3.new(0, 3, 2))
-                        hrp.Velocity = Vector3.new()
-                        task.wait(0.5)
-                        for _ = 1, 5 do
-                            if not bpr.Enabled or _G.HKT ~= nil then break end
-                            pcall(function() fireproximityprompt(bpr) end)
-                            task.wait(0.7)
-                        end
-                    end
-                end
-            end)
-        end
-        task.wait(3)
-    end
-end)
+-- ==============================================================================
+-- VISUALS & ESP
+-- ==============================================================================
+local esp = {
+    enabled         = false,
+    enemies         = true,
+    bosses          = true,
+    chests          = true,
+    drops           = true,
+    players         = false,
+    dummies         = false,
 
--- 5) Zone-touch idle: mob 0 -> sentuh Zone tiap room (mancing wave)
-task.spawn(function()
-    local idx = 1
-    local sessAt, sessMob = 0, nil
-    while true do
-        if _G.HK and _G.HK.autoFarm and _G.HKT == nil then
-            pcall(function()
-                local now = os.clock()
-                if now - sessAt > 10 then
-                    sessAt = now
-                    sessMob = nil
-                    local rf = game.ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"]
-                        .knit.Services.DungeonRunService.RF.GetSessionInfo
-                    local ok, s = pcall(function() return rf:InvokeServer() end)
-                    if ok and type(s) == "table" and tonumber(s.MobsRemaining) then
-                        sessMob = tonumber(s.MobsRemaining)
-                    end
-                end
-                if sessMob == 0 then
-                    local P = game.Players.LocalPlayer
-                    local hrp = P.Character and P.Character:FindFirstChild("HumanoidRootPart")
-                    if hrp then
-                        local gen = nil
-                        for _, c in ipairs(workspace:GetChildren()) do
-                            if string.find(c.Name, "Generated_") then gen = c break end
-                        end
-                        if gen then
-                            local zones = {}
-                            for i = 1, 30 do
-                                local r = gen:FindFirstChild("Room_" .. i)
-                                local z = r and r:FindFirstChild("Zone")
-                                if z then
-                                    local ok, cf = pcall(function() return z:GetPivot() end)
-                                    if ok then table.insert(zones, cf.Position) end
-                                end
-                            end
-                            if #zones > 0 then
-                                if idx > #zones then idx = 1 end
-                                local zp = zones[idx]
-                                idx = idx + 1
-                                hrp.CFrame = CFrame.new(zp + Vector3.new(0, 3, 0))
-                                hrp.Velocity = Vector3.new()
-                                task.wait(1.2)
-                                hrp.CFrame = CFrame.new(zp + Vector3.new(8, 3, 0))
-                                hrp.Velocity = Vector3.new()
-                                task.wait(1.2)
-                            end
-                        end
-                    end
-                end
-            end)
-        end
-        task.wait(2)
-    end
-end)
+    box             = true,
+    boxStyle        = "Corner",
+    names           = true,
+    health          = true,
+    distance        = true,
+    tracers         = false,
+    tracerOrigin    = "Bottom",
+    chams           = true,
+    maxDistance     = 600,
 
-print("[HK] patch FINAL aktif: bless-id + altar-lock + chest-global + zone-touch")
+    enemyColor      = Color3.fromRGB(255, 65, 65),
+    bossColor       = Color3.fromRGB(255, 215, 0),
+    chestColor      = Color3.fromRGB(255, 170, 0),
+    dropColor       = Color3.fromRGB(80, 220, 255),
+    playerColor     = Color3.fromRGB(120, 255, 120),
+    dummyColor      = Color3.fromRGB(200, 200, 200),
+}
+
+local hasDrawing = type(Drawing) == "table" and type(Drawing.new) == "function"
+local trackedEspObjects = {}
+
+local function createDrawingObject()
+    if not hasDrawing then return {} end
+    local o = {}
+    o.box = trackDrawing(Drawing.new("Square"))
+    o.box.Thickness = 1.5; o.box.Filled = false; o.box.Visible = false
+
+    o.boxOutline = trackDrawing(Drawing.new("Square"))
+    o.boxOutline.Thickness = 3.5; o.boxOutline.Filled = false; o.boxOutline.Color = Color3.new(0, 0, 0); o.boxOutline.Visible = false
+
+    o.corners = {}
+    for i = 1, 8 do
+        local l = trackDrawing(Drawing.new("Line"))
+        l.Thickness = 1.5; l.Visible = false
+        table.insert(o.corners, l)
+    end
+
+    o.name = trackDrawing(Drawing.new("Text"))
+    o.name.Size = 13; o.name.Center = true; o.name.Outline = true; o.name.Visible = false
+
+    o.dist = trackDrawing(Drawing.new("Text"))
+    o.dist.Size = 11; o.dist.Center = true; o.dist.Outline = true; o.dist.Visible = false
+
+    o.hp = trackDrawing(Drawing.new("Line"))
+    o.hp.Thickness = 2.5; o.hp.Visible = false
+
+    o.hpOutline = trackDrawing(Drawing.new("Line"))
+    o.hpOutline.Thickness = 4.5; o.hpOutline.Color = Color3.new(0, 0, 0); o.hpOutline.Visible = false
+
+    o.tracer = trackDrawing(Drawing.new("Line"))
+    o.tracer.Thickness = 1.2; o.tracer.Visible = false
+
+    return o
+end
+
+local function getBox2D(model)
+    if not model then return nil end
+    local cf, size
+    local ok, resCf, resSz = pcall(function() return model:GetBoundingBox() end)
+    if ok and resCf and resSz and resSz.Magnitude > 1 then
+        cf, size = resCf, resSz
+    else
+        local root = GetModelRoot(model)
+        if not root then return nil end
+        cf = root.CFrame
+        size = Vector3.new(3, 5, 3)
+    end
+
+    local minX, minY = math.huge, math.huge
+    local maxX, maxY = -math.huge, -math.huge
+    local anyOn = false
+
+    for x = -1, 1, 2 do
+        for y = -1, 1, 2 do
+            for z = -1, 1, 2 do
+                local corner = (cf * CFrame.new(size.X/2 * x, size.Y/2 * y, size.Z/2 * z)).Position
+                local sp, on = Camera:WorldToViewportPoint(corner)
+                if sp.Z > 0 then
+                    anyOn = anyOn or on
+                    minX = math.min(minX, sp.X); minY = math.min(minY, sp.Y)
+                    maxX = math.max(maxX, sp.X); maxY = math.max(maxY, sp.Y)
+                end
+            end
+        end
+    end
+
+    if minX == math.huge or not anyOn then return nil end
+    return minX, minY, maxX, maxY
+end
+
+-- ESP Render Step
+track(RunService.RenderStepped:Connect(function()
+    if HUB.dead or not esp.enabled then
+        for _, obj in pairs(trackedEspObjects) do
+            if obj.box then obj.box.Visible = false end
+            if obj.boxOutline then obj.boxOutline.Visible = false end
+            if obj.corners then for _, l in ipairs(obj.corners) do l.Visible = false end end
+            if obj.name then obj.name.Visible = false end
+            if obj.dist then obj.dist.Visible = false end
+            if obj.hp then obj.hp.Visible = false end
+            if obj.hpOutline then obj.hpOutline.Visible = false end
+            if obj.tracer then obj.tracer.Visible = false end
+            if obj.highlight then obj.highlight.Enabled = false end
+        end
+        return
+    end
+
+    local hrp = GetHRP()
+    local myPos = hrp and hrp.Position or Vector3.zero
+    local viewport = Camera.ViewportSize
+
+    local renderItems = {}
+
+    -- Enemies & Bosses
+    if esp.enemies or esp.bosses then
+        local targets = GetAllTargets(false, true, esp.maxDistance > 0 and esp.maxDistance or nil)
+        for _, t in ipairs(targets) do
+            if (t.IsBoss and esp.bosses) or (not t.IsBoss and esp.enemies) then
+                table.insert(renderItems, {
+                    Key = t.Model,
+                    Model = t.Model,
+                    Name = t.IsBoss and ("[BOSS] " .. t.Model.Name) or t.Model.Name,
+                    Color = t.IsBoss and esp.bossColor or esp.enemyColor,
+                    Dist = t.Dist,
+                    ShowHP = true,
+                })
+            end
+        end
+    end
+
+    -- Chests ESP (Physical Dungeon & Boss Chests)
+    if esp.chests then
+        for _, d in ipairs(Workspace:GetDescendants()) do
+            if d:IsA("Model") and (d.Name:find("DungeonChest") or d.Name:find("BossLootChest") or d.Name == "Blessing_Altar") then
+                local pos = d:GetPivot().Position
+                local dist = (pos - myPos).Magnitude
+                if esp.maxDistance <= 0 or dist <= esp.maxDistance then
+                    local chestName = d.Name == "Blessing_Altar" and "[ALTAR] Blessing" or (d.Name:find("BossLootChest") and "[BOSS CHEST]" or "[CHEST] Room Chest")
+                    table.insert(renderItems, {
+                        Key = d,
+                        Model = d,
+                        Name = chestName,
+                        Color = esp.chestColor,
+                        Dist = dist,
+                        ShowHP = false,
+                    })
+                end
+            end
+        end
+    end
+
+    -- Dummies
+    if esp.dummies then
+        local dummies = GetAllTargets(true, false, esp.maxDistance > 0 and esp.maxDistance or nil)
+        for _, t in ipairs(dummies) do
+            table.insert(renderItems, {
+                Key = t.Model,
+                Model = t.Model,
+                Name = "Dummy",
+                Color = esp.dummyColor,
+                Dist = t.Dist,
+                ShowHP = false,
+            })
+        end
+    end
+
+    -- Players
+    if esp.players then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and p.Character then
+                local pHrp = p.Character:FindFirstChild("HumanoidRootPart")
+                if pHrp then
+                    local dist = (pHrp.Position - myPos).Magnitude
+                    if esp.maxDistance <= 0 or dist <= esp.maxDistance then
+                        local cls = p:GetAttribute("Active_Class") or p:GetAttribute("Current_Class") or ""
+                        local nameText = p.DisplayName .. (cls ~= "" and (" [" .. cls .. "]") or "")
+                        table.insert(renderItems, {
+                            Key = p,
+                            Model = p.Character,
+                            Name = nameText,
+                            Color = esp.playerColor,
+                            Dist = dist,
+                            ShowHP = true,
+                        })
+                    end
+                end
+            end
+        end
+    end
+
+    local activeKeys = {}
+    for _, item in ipairs(renderItems) do
+        activeKeys[item.Key] = true
+        local obj = trackedEspObjects[item.Key]
+        if not obj then
+            obj = createDrawingObject()
+            trackedEspObjects[item.Key] = obj
+        end
+
+        local leftX, topY, rightX, bottomY = getBox2D(item.Model)
+        if leftX and topY and rightX and bottomY and hasDrawing then
+            local w = rightX - leftX
+            local h = bottomY - topY
+            local cx = (leftX + rightX) / 2
+            local cy = (topY + bottomY) / 2
+
+            -- Box
+            if esp.box then
+                if esp.boxStyle == "Corner" then
+                    if obj.box then obj.box.Visible = false end
+                    if obj.boxOutline then obj.boxOutline.Visible = false end
+                    local clen = math.clamp(w * 0.25, 4, 18)
+                    local pts = {
+                        { Vector2.new(leftX, topY), Vector2.new(leftX + clen, topY) },
+                        { Vector2.new(leftX, topY), Vector2.new(leftX, topY + clen) },
+                        { Vector2.new(rightX, topY), Vector2.new(rightX - clen, topY) },
+                        { Vector2.new(rightX, topY), Vector2.new(rightX, topY + clen) },
+                        { Vector2.new(leftX, bottomY), Vector2.new(leftX + clen, bottomY) },
+                        { Vector2.new(leftX, bottomY), Vector2.new(leftX, bottomY - clen) },
+                        { Vector2.new(rightX, bottomY), Vector2.new(rightX - clen, bottomY) },
+                        { Vector2.new(rightX, bottomY), Vector2.new(rightX, bottomY - clen) },
+                    }
+                    for i, seg in ipairs(pts) do
+                        local l = obj.corners[i]
+                        if l then
+                            l.From = seg[1]; l.To = seg[2]; l.Color = item.Color; l.Visible = true
+                        end
+                    end
+                else
+                    if obj.corners then for _, l in ipairs(obj.corners) do l.Visible = false end end
+                    if obj.box then
+                        obj.box.Position = Vector2.new(leftX, topY); obj.box.Size = Vector2.new(w, h); obj.box.Color = item.Color; obj.box.Visible = true
+                    end
+                    if obj.boxOutline then
+                        obj.boxOutline.Position = Vector2.new(leftX, topY); obj.boxOutline.Size = Vector2.new(w, h); obj.boxOutline.Visible = true
+                    end
+                end
+            else
+                if obj.box then obj.box.Visible = false end
+                if obj.boxOutline then obj.boxOutline.Visible = false end
+                if obj.corners then for _, l in ipairs(obj.corners) do l.Visible = false end end
+            end
+
+            -- Name
+            if esp.names and obj.name then
+                obj.name.Text = item.Name; obj.name.Position = Vector2.new(cx, topY - 16); obj.name.Color = item.Color; obj.name.Visible = true
+            elseif obj.name then obj.name.Visible = false end
+
+            -- Distance
+            if esp.distance and obj.dist then
+                obj.dist.Text = string.format("%d studs", math.floor(item.Dist)); obj.dist.Position = Vector2.new(cx, bottomY + 2); obj.dist.Color = Color3.fromRGB(220, 220, 220); obj.dist.Visible = true
+            elseif obj.dist then obj.dist.Visible = false end
+
+            -- Health Bar
+            local hum = item.Model:FindFirstChildOfClass("Humanoid")
+            if esp.health and item.ShowHP and hum and hum.MaxHealth > 0 and obj.hp and obj.hpOutline then
+                local pct = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+                local barX = leftX - 6
+                obj.hpOutline.From = Vector2.new(barX, bottomY); obj.hpOutline.To = Vector2.new(barX, topY); obj.hpOutline.Visible = true
+                obj.hp.From = Vector2.new(barX, bottomY); obj.hp.To = Vector2.new(barX, bottomY - (h * pct))
+                obj.hp.Color = Color3.fromRGB(math.floor(255 * (1 - pct)), math.floor(255 * pct), 50); obj.hp.Visible = true
+            elseif obj.hp then
+                obj.hp.Visible = false
+                if obj.hpOutline then obj.hpOutline.Visible = false end
+            end
+
+            -- Tracer
+            if esp.tracers and obj.tracer then
+                local origin = Vector2.new(viewport.X / 2, viewport.Y)
+                if esp.tracerOrigin == "Center" then origin = Vector2.new(viewport.X / 2, viewport.Y / 2)
+                elseif esp.tracerOrigin == "Mouse" then origin = UserInputService:GetMouseLocation() end
+                obj.tracer.From = origin; obj.tracer.To = Vector2.new(cx, bottomY); obj.tracer.Color = item.Color; obj.tracer.Visible = true
+            elseif obj.tracer then obj.tracer.Visible = false end
+        else
+            if obj.box then obj.box.Visible = false end
+            if obj.boxOutline then obj.boxOutline.Visible = false end
+            if obj.corners then for _, l in ipairs(obj.corners) do l.Visible = false end end
+            if obj.name then obj.name.Visible = false end
+            if obj.dist then obj.dist.Visible = false end
+            if obj.hp then obj.hp.Visible = false end
+            if obj.hpOutline then obj.hpOutline.Visible = false end
+            if obj.tracer then obj.tracer.Visible = false end
+        end
+
+        -- Chams
+        if esp.chams then
+            if not obj.highlight then
+                local hl = Instance.new("Highlight")
+                hl.Name = "OxideHighlight"; hl.FillTransparency = 0.5; hl.OutlineTransparency = 0
+                hl.Adornee = item.Model; hl.Parent = item.Model
+                obj.highlight = hl; table.insert(HUB.highlights, hl)
+            end
+            obj.highlight.FillColor = item.Color; obj.highlight.OutlineColor = Color3.new(1, 1, 1); obj.highlight.Enabled = true
+        elseif obj.highlight then
+            obj.highlight.Enabled = false
+        end
+    end
+
+    for key, obj in pairs(trackedEspObjects) do
+        if not activeKeys[key] then
+            if obj.box then obj.box.Visible = false end
+            if obj.boxOutline then obj.boxOutline.Visible = false end
+            if obj.corners then for _, l in ipairs(obj.corners) do l.Visible = false end end
+            if obj.name then obj.name.Visible = false end
+            if obj.dist then obj.dist.Visible = false end
+            if obj.hp then obj.hp.Visible = false end
+            if obj.hpOutline then obj.hpOutline.Visible = false end
+            if obj.tracer then obj.tracer.Visible = false end
+            if obj.highlight then obj.highlight.Enabled = false end
+        end
+    end
+end))
+
+-- Fullbright
+local fullbrightEnabled = false
+local defaultAmbient = Lighting.Ambient
+local defaultOutdoor = Lighting.OutdoorAmbient
+local defaultBrightness = Lighting.Brightness
+local defaultClockTime = Lighting.ClockTime
+
+local function SetFullbright(v)
+    fullbrightEnabled = v
+    if v then
+        Lighting.Ambient = Color3.fromRGB(255, 255, 255)
+        Lighting.OutdoorAmbient = Color3.fromRGB(255, 255, 255)
+        Lighting.Brightness = 2
+        Lighting.ClockTime = 14
+    else
+        Lighting.Ambient = defaultAmbient
+        Lighting.OutdoorAmbient = defaultOutdoor
+        Lighting.Brightness = defaultBrightness
+        Lighting.ClockTime = defaultClockTime
+    end
+end
+
+-- ==============================================================================
+-- MOVEMENT & PLAYER MODIFIERS
+-- ==============================================================================
+local walkSpeedEnabled = false
+local walkSpeedVal     = 24
+local jumpPowerEnabled = false
+local jumpPowerVal     = 60
+local infiniteJump     = false
+local flying           = false
+local flySpeed         = 60
+local noclip           = false
+local antiAFK          = false
+
+local function ApplyWalkSpeed(v)
+    walkSpeedVal = v
+    local hum = GetHumanoid()
+    if hum and walkSpeedEnabled then hum.WalkSpeed = v end
+end
+
+local function ApplyJumpPower(v)
+    jumpPowerVal = v
+    local hum = GetHumanoid()
+    if hum and jumpPowerEnabled then
+        hum.UseJumpPower = true
+        hum.JumpPower = v
+    end
+end
+
+track(RunService.Stepped:Connect(function()
+    if HUB.dead then return end
+    local hum = GetHumanoid()
+    if hum then
+        if walkSpeedEnabled then hum.WalkSpeed = walkSpeedVal end
+        if jumpPowerEnabled then hum.UseJumpPower = true; hum.JumpPower = jumpPowerVal end
+    end
+    if noclip then
+        local char = GetCharacter()
+        if char then
+            for _, p in ipairs(char:GetDescendants()) do
+                if p:IsA("BasePart") then p.CanCollide = false end
+            end
+        end
+    end
+end))
+
+track(UserInputService.JumpRequest:Connect(function()
+    if infiniteJump and not HUB.dead then
+        local hum = GetHumanoid()
+        if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+    end
+end))
+
+local function startFly()
+    if flying then return end
+    local hrp = GetHRP()
+    local hum = GetHumanoid()
+    if not (hrp and hum) then return end
+    flying = true
+    hrp.Anchored = true
+
+    local bodyGyro = Instance.new("BodyGyro")
+    bodyGyro.MaxTorque = Vector3.new(1, 1, 1) * 1e5
+    bodyGyro.P = 1e5
+    bodyGyro.CFrame = hrp.CFrame
+    bodyGyro.Parent = hrp
+
+    HUB._fly = {
+        hrp = hrp,
+        gyro = bodyGyro,
+        conn = track(RunService.RenderStepped:Connect(function(dt)
+            if not flying or HUB.dead then return end
+            local cam = Camera
+            if not cam then return end
+            local look = cam.CFrame.LookVector
+            local right = cam.CFrame.RightVector
+            local flatLook = Vector3.new(look.X, 0, look.Z)
+            flatLook = flatLook.Magnitude > 0.001 and flatLook.Unit or Vector3.new(0, 0, -1)
+            local flatRight = Vector3.new(right.X, 0, right.Z)
+            flatRight = flatRight.Magnitude > 0.001 and flatRight.Unit or Vector3.new(1, 0, 0)
+
+            local dir = Vector3.zero
+            if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir = dir + flatLook end
+            if UserInputService:IsKeyDown(Enum.KeyCode.S) then dir = dir - flatLook end
+            if UserInputService:IsKeyDown(Enum.KeyCode.A) then dir = dir - flatRight end
+            if UserInputService:IsKeyDown(Enum.KeyCode.D) then dir = dir + flatRight end
+            if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir = dir + Vector3.new(0, 1, 0) end
+            if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then dir = dir - Vector3.new(0, 1, 0) end
+
+            if dir.Magnitude > 0 then
+                hrp.CFrame = hrp.CFrame + dir.Unit * flySpeed * math.min(dt, 0.1)
+            end
+            bodyGyro.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + look)
+        end))
+    }
+end
+
+local function stopFly()
+    flying = false
+    local f = HUB._fly
+    if f then
+        pcall(function() f.conn:Disconnect() end)
+        pcall(function() f.hrp.Anchored = false end)
+        pcall(function() f.gyro:Destroy() end)
+        HUB._fly = nil
+    end
+end
+
+local antiAfkConn = nil
+local function SetAntiAFK(v)
+    antiAFK = v
+    if v and not antiAfkConn then
+        antiAfkConn = track(LocalPlayer.Idled:Connect(function()
+            if antiAFK then
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.new())
+            end
+        end))
+    elseif not v and antiAfkConn then
+        pcall(function() antiAfkConn:Disconnect() end)
+        antiAfkConn = nil
+    end
+end
+
+-- ==============================================================================
+-- TELEPORT DESTINATIONS
+-- ==============================================================================
+local LOBBY_LOCATIONS = {
+    ["Spawn 1"]          = Vector3.new(10260.7, 1216.5, 1104.5),
+    ["Spawn 2"]          = Vector3.new(10303.5, 1199.9, 149.8),
+    ["Spawn 3"]          = Vector3.new(10248.2, 1187.7, 1208.2),
+    ["Big Portal"]       = Vector3.new(2229.8, 605.9, -2387.5),
+    ["Boss Portal"]      = Vector3.new(3099.0, 602.0, -2079.0),
+    ["Secret 1"]         = Vector3.new(11601.4, 1153.5, 1243.0),
+    ["PVP Arena"]        = Vector3.new(10179.4, 1187.1, 221.2),
+    ["Combat Dummies"]   = Vector3.new(10200.0, 1185.0, 1050.0),
+}
+
+local LOBBY_NPCS = {
+    ["Guide"]            = Vector3.new(10247.0, 1185.5, 1106.2),
+    ["Forge Archon"]     = Vector3.new(10086.8, 1184.1, 1086.8),
+    ["Great Mage"]       = Vector3.new(10191.3, 1184.7, 987.4),
+    ["Cursed King"]      = Vector3.new(10251.2, 1184.7, 999.5),
+    ["Kage"]             = Vector3.new(9998.0, 1185.1, 1033.1),
+    ["Enzo"]             = Vector3.new(10092.6, 1184.3, 1053.8),
+    ["Jetstream"]        = Vector3.new(10590.4, 1161.6, 1358.2),
+    ["Valen"]            = Vector3.new(10737.3, 1187.6, 1337.3),
+    ["Tenjin"]           = Vector3.new(10204.5, 1182.1, 1225.0),
+    ["Genesis"]          = Vector3.new(10272.1, 1194.2, 214.8),
+    ["Rose"]             = Vector3.new(10281.0, 1185.6, 1030.4),
+    ["Hitman"]           = Vector3.new(10135.7, 1181.8, 977.5),
+    ["Group Chest NPC"]  = Vector3.new(10280.4, 1180.8, 1165.5),
+}
+
+local selectedLobbyLocation = "Spawn 1"
+local selectedLobbyNpc      = "Guide"
+
+local locKeys = {}
+for k in pairs(LOBBY_LOCATIONS) do table.insert(locKeys, k) end
+table.sort(locKeys)
+
+local npcKeys = {}
+for k in pairs(LOBBY_NPCS) do table.insert(npcKeys, k) end
+table.sort(npcKeys)
+
+-- ==============================================================================
+-- UI CREATION - EXACTLY 5 MAIN TABS
+-- ==============================================================================
+local CombatTab   = Window:AddTab({ Name = "Combat", Subtitle = "Aura, skills & dungeons", Icon = "combat" })
+local EconomyTab  = Window:AddTab({ Name = "Economy", Subtitle = "Drops, quests & gacha", Icon = "bolt" })
+local VisualsTab  = Window:AddTab({ Name = "Visuals", Subtitle = "ESP & lighting", Icon = "eye" })
+local PlayerTab   = Window:AddTab({ Name = "Player", Subtitle = "Movement & teleports", Icon = "player" })
+local SettingsTab = Window:AddTab({ Name = "Settings", Subtitle = "Configs & unloader", Icon = "gear" })
+
+-- -----------------------------------------------------------------------------
+-- TAB 1: COMBAT & DUNGEONS
+-- -----------------------------------------------------------------------------
+local AuraSub          = CombatTab:AddSubTab("Kill Aura")
+local SkillsSub        = CombatTab:AddSubTab("Auto Skills")
+local HitboxSub        = CombatTab:AddSubTab("Hitbox Expander")
+local DungeonFarmSub   = CombatTab:AddSubTab("Auto Dungeon")
+local DungeonChestsSub = CombatTab:AddSubTab("Chests & Rewards")
+
+-- SubTab: Kill Aura
+AuraSub:AddToggle({
+    Name = "Kill Aura / Auto Attack", Default = false, Flag = "combat_killaura",
+    Callback = safeCallback(function(v)
+        killAuraEnabled = v
+        Notify("Kill Aura", v and "Enabled" or "Disabled", v and "Success" or "Error")
+    end)
+})
+AuraSub:AddDropdown({
+    Name = "Target Filter", Options = { "All Targets", "Target Nearest", "Target Boss Only", "Target Dummies", "Legit Directional" },
+    Items = { "All Targets", "Target Nearest", "Target Boss Only", "Target Dummies", "Legit Directional" },
+    Default = "All Targets", Flag = "combat_mode", Callback = function(v) killAuraMode = v end
+})
+AuraSub:AddSlider({
+    Name = "Aura Radius", Min = 10, Max = 150, Default = 50, Suffix = " studs", Flag = "combat_radius",
+    Callback = function(v) killAuraRadius = v end
+})
+AuraSub:AddSlider({
+    Name = "Attack Delay", Min = 0.04, Max = 0.5, Default = 0.08, Suffix = "s", Flag = "combat_delay",
+    Callback = function(v) killAuraDelay = v end
+})
+AuraSub:AddToggle({
+    Name = "Auto Face Target", Default = true, Flag = "combat_face",
+    Callback = function(v) killAuraFaceTarget = v end
+})
+AuraSub:AddButton({
+    Name = "Attack Once (Manual)", Primary = true,
+    Callback = safeCallback(function()
+        local t = GetClosestTarget(killAuraMode, killAuraRadius)
+        local hrp = GetHRP()
+        local dir = (t and t.Pos and hrp) and (t.Pos - hrp.Position).Unit or (Camera and Camera.CFrame.LookVector) or Vector3.new(0, 0, 1)
+        FireAttack(dir)
+        Notify("Attack", "Fired attack", "Info")
+    end)
+})
+
+-- SubTab: Auto Skills
+SkillsSub:AddToggle({
+    Name = "Auto Cast All Skills", Default = false, Flag = "skills_auto",
+    Callback = safeCallback(function(v)
+        autoSkillsEnabled = v
+        Notify("Auto Skills", v and "Enabled" or "Disabled", v and "Success" or "Error")
+    end)
+})
+SkillsSub:AddSection("Skill Toggles")
+SkillsSub:AddToggle({ Name = "Cast Skill 1", Default = true, Flag = "skill_1", Callback = function(v) skill1Enabled = v end })
+SkillsSub:AddToggle({ Name = "Cast Skill 2", Default = true, Flag = "skill_2", Callback = function(v) skill2Enabled = v end })
+SkillsSub:AddToggle({ Name = "Cast Skill 3", Default = true, Flag = "skill_3", Callback = function(v) skill3Enabled = v end })
+SkillsSub:AddToggle({ Name = "Cast Skill 4", Default = true, Flag = "skill_4", Callback = function(v) skill4Enabled = v end })
+SkillsSub:AddToggle({ Name = "Cast Ultimate (Skill E)", Default = true, Flag = "skill_ult", Callback = function(v) skillUltEnabled = v end })
+
+SkillsSub:AddSection("Manual Skill Actions")
+SkillsSub:AddButton({
+    Name = "Cast All Ready Skills (Manual)", Primary = true,
+    Callback = safeCallback(function()
+        local t = GetClosestTarget("All Targets", 60)
+        local hrp = GetHRP()
+        local dir = (t and t.Pos and hrp) and (t.Pos - hrp.Position).Unit or (Camera and Camera.CFrame.LookVector) or Vector3.new(0, 0, 1)
+        if not LocalPlayer:GetAttribute("Skill1_OnCooldown") then FireSkill(1, "tap", dir) end
+        if not LocalPlayer:GetAttribute("Skill2_OnCooldown") then FireSkill(2, "tap", dir) end
+        if not LocalPlayer:GetAttribute("Skill3_OnCooldown") then FireSkill(3, "tap", dir) end
+        if not LocalPlayer:GetAttribute("Skill4_OnCooldown") then FireSkill(4, "tap", dir) end
+        if LocalPlayer:GetAttribute("UltimateReady") == true or (not LocalPlayer:GetAttribute("SkillE_OnCooldown") and LocalPlayer:GetAttribute("HasUltimate") == true) then
+            FireSkill("E", "tap", dir)
+        end
+        Notify("Skills", "Casting all ready skills", "Info")
+    end)
+})
+SkillsSub:AddButton({
+    Name = "Cast Ultimate Now",
+    Callback = safeCallback(function()
+        local t = GetClosestTarget("All Targets", 60)
+        local hrp = GetHRP()
+        local dir = (t and t.Pos and hrp) and (t.Pos - hrp.Position).Unit or (Camera and Camera.CFrame.LookVector) or Vector3.new(0, 0, 1)
+        FireSkill("E", "tap", dir)
+        Notify("Ultimate", "Fired ultimate skill", "Info")
+    end)
+})
+
+SkillsSub:AddSection("Defense & Potions")
+SkillsSub:AddToggle({
+    Name = "Auto Health Potion", Default = false, Flag = "auto_potion",
+    Callback = safeCallback(function(v)
+        autoPotionEnabled = v
+        Notify("Auto Potion", v and "Enabled" or "Disabled", v and "Success" or "Error")
+    end)
+})
+SkillsSub:AddSlider({
+    Name = "Drink When Health Below", Min = 10, Max = 90, Default = 45, Suffix = "%", Flag = "potion_threshold",
+    Callback = function(v) autoPotionThreshold = v end
+})
+SkillsSub:AddButton({
+    Name = "Drink Potion Now", Primary = true,
+    Callback = safeCallback(function()
+        local ps = GetKnitService("PotionService")
+        if ps then
+            ps:UsePotion(1):await()
+            Notify("Potion", "Used equipped health potion", "Success")
+        end
+    end)
+})
+
+-- SubTab: Hitbox Expander
+HitboxSub:AddToggle({
+    Name = "Hitbox Expander", Default = false, Flag = "hitbox_enabled",
+    Callback = safeCallback(function(v)
+        hitboxExpanderEnabled = v
+        Notify("Hitbox Expander", v and "Enabled" or "Disabled", v and "Success" or "Error")
+    end)
+})
+HitboxSub:AddSlider({
+    Name = "Hitbox Size", Min = 5, Max = 50, Default = 15, Suffix = " studs", Flag = "hitbox_size",
+    Callback = function(v) hitboxSize = v end
+})
+HitboxSub:AddSlider({
+    Name = "Hitbox Transparency", Min = 0, Max = 1, Default = 0.6, Suffix = "", Flag = "hitbox_trans",
+    Callback = function(v) hitboxTransparency = v end
+})
+
+-- SubTab: Auto Dungeon (AFK Grinder)
+DungeonFarmSub:AddSection("AFK Full Automation")
+DungeonFarmSub:AddToggle({
+    Name = "AFK Dungeon Grinder (Auto Clear & Farm)", Default = false, Flag = "dungeon_afk_grind",
+    Callback = safeCallback(function(v)
+        autoDungeonAfkGrind = v
+        if v then
+            killAuraEnabled = true
+            autoSkillsEnabled = true
+            autoPotionEnabled = true
+        end
+        Notify("AFK Grinder", v and "Started AFK Dungeon Loop!" or "Stopped AFK Loop", v and "Success" or "Info")
+    end)
+})
+
+DungeonFarmSub:AddSection("Dungeon Configuration")
+DungeonFarmSub:AddDropdown({
+    Name = "Select Dungeon", Options = DUNGEONS, Items = DUNGEONS, Default = "Bandits Den", Flag = "dungeon_choice",
+    Callback = function(v) selectedDungeon = v end
+})
+DungeonFarmSub:AddDropdown({
+    Name = "Select Difficulty", Options = DIFFICULTIES, Items = DIFFICULTIES,
+    Default = "Normal", Flag = "dungeon_diff", Callback = function(v) selectedDifficulty = v end
+})
+DungeonFarmSub:AddToggle({
+    Name = "Auto Solo Queue (Lobby)", Default = false, Flag = "dungeon_auto_queue",
+    Callback = safeCallback(function(v)
+        autoSoloQueue = v
+        Notify("Auto Queue", v and "Enabled" or "Disabled", v and "Success" or "Error")
+    end)
+})
+DungeonFarmSub:AddToggle({
+    Name = "Auto Replay on Victory", Default = false, Flag = "dungeon_auto_replay",
+    Callback = function(v) autoReplayDungeon = v end
+})
+DungeonFarmSub:AddToggle({
+    Name = "Auto Return to Lobby", Default = false, Flag = "dungeon_auto_return",
+    Callback = function(v) autoReturnLobby = v end
+})
+DungeonFarmSub:AddToggle({
+    Name = "Auto Mob Teleport (Dungeon)", Default = false, Flag = "dungeon_auto_mobtp",
+    Callback = safeCallback(function(v)
+        autoNextMobTeleport = v
+        Notify("Mob Teleport", v and "Enabled" or "Disabled", v and "Success" or "Error")
+    end)
+})
+DungeonFarmSub:AddButton({
+    Name = "Start Selected Dungeon Solo Now", Primary = true,
+    Callback = safeCallback(function()
+        local ok = StartSoloDungeon(selectedDungeon, selectedDifficulty)
+        Notify("Dungeon Queue", ok and ("Queued " .. selectedDungeon .. " (" .. selectedDifficulty .. ")") or "Queue request failed", ok and "Success" or "Error")
+    end)
+})
+DungeonFarmSub:AddButton({
+    Name = "Return to Lobby Now",
+    Callback = safeCallback(function()
+        ReturnToLobby()
+        Notify("Lobby", "Requested return to lobby", "Info")
+    end)
+})
+
+-- SubTab: Chests & Rewards (Instant Distance TP Looting)
+DungeonChestsSub:AddSection("Automatic Reward & Loot Claims")
+DungeonChestsSub:AddToggle({
+    Name = "Auto Claim Mid-Run Chests (GUI)", Default = false, Flag = "chests_midrun",
+    Callback = function(v) autoClaimMidChests = v end
+})
+DungeonChestsSub:AddToggle({
+    Name = "Auto Claim End-Run Chests (GUI)", Default = false, Flag = "chests_endrun",
+    Callback = function(v) autoClaimEndChests = v end
+})
+DungeonChestsSub:AddToggle({
+    Name = "Auto Loot Room Chests (Physical TP)", Default = false, Flag = "chests_room",
+    Callback = function(v) autoLootRoomChests = v end
+})
+DungeonChestsSub:AddToggle({
+    Name = "Auto Loot Boss Chests (Physical TP)", Default = false, Flag = "chests_boss",
+    Callback = function(v) autoLootBossChests = v end
+})
+DungeonChestsSub:AddToggle({
+    Name = "Auto Claim Blessing Altars (TP)", Default = false, Flag = "altars_auto",
+    Callback = function(v) autoClaimAltars = v end
+})
+DungeonChestsSub:AddToggle({
+    Name = "Auto Refill Potion Stations (TP)", Default = false, Flag = "potions_station_auto",
+    Callback = function(v) autoRefillPotions = v end
+})
+DungeonChestsSub:AddToggle({
+    Name = "Auto Unlock Key Doors (TP)", Default = false, Flag = "doors_unlock_auto",
+    Callback = function(v) autoUnlockDoors = v end
+})
+DungeonChestsSub:AddToggle({
+    Name = "Instant Teleport-Loot (Bypass Distance)", Default = true, Flag = "teleport_loot_enabled",
+    Callback = function(v) autoTeleportLoot = v end
+})
+
+DungeonChestsSub:AddSection("Instant Actions (Any Distance)")
+DungeonChestsSub:AddButton({
+    Name = "Loot All Chests & Altars in Dungeon", Primary = true,
+    Callback = safeCallback(function()
+        local count = LootEverythingInDungeon(true)
+        Notify("Dungeon Loot", "Instant-looted " .. count .. " items / altars / chests!", "Success")
+    end)
+})
+DungeonChestsSub:AddButton({
+    Name = "Claim Mid-Run / End-Run Chests (GUI)", Primary = true,
+    Callback = safeCallback(function()
+        ClaimMidRunChestsInternal(false)
+        ClaimEndChestsInternal(false)
+        Notify("Reward Chests", "Claimed active reward chests", "Success")
+    end)
+})
+DungeonChestsSub:AddButton({
+    Name = "Loot All Room Chests (TP)",
+    Callback = safeCallback(function()
+        local c = LootAllPhysicalRoomChests(true)
+        Notify("Room Chests", "Looted " .. c .. " chest(s)", "Success")
+    end)
+})
+DungeonChestsSub:AddButton({
+    Name = "Loot All Boss Chests (TP)",
+    Callback = safeCallback(function()
+        local c = LootAllBossLootChests(true)
+        Notify("Boss Chests", "Looted " .. c .. " boss chest(s)", "Success")
+    end)
+})
+DungeonChestsSub:AddButton({
+    Name = "Claim Blessing Altars & Refill Potions (TP)",
+    Callback = safeCallback(function()
+        local b = ClaimAllBlessingAltars(true)
+        local p = RefillAllPotionStations(true)
+        Notify("Altars & Stations", "Claimed " .. b .. " altar(s), " .. p .. " station(s)", "Success")
+    end)
+})
+DungeonChestsSub:AddButton({
+    Name = "Unlock All Key Doors (TP)",
+    Callback = safeCallback(function()
+        local d = UnlockAllKeyDoors(true)
+        Notify("Key Doors", "Unlocked " .. d .. " door(s)", "Success")
+    end)
+})
+
+-- -----------------------------------------------------------------------------
+-- TAB 2: ECONOMY & AUTO-FARM
+-- -----------------------------------------------------------------------------
+local DropsSub   = EconomyTab:AddSubTab("Drops & Gear")
+local QuestsSub  = EconomyTab:AddSubTab("Quests & Codes")
+local SummonSub  = EconomyTab:AddSubTab("Summon & Gacha")
+local ShopSub    = EconomyTab:AddSubTab("Shop & Stats")
+
+-- SubTab: Drops & Gear
+DropsSub:AddToggle({
+    Name = "Auto Collect Drops (Coins/Gems/Stones)", Default = false, Flag = "drops_auto",
+    Callback = safeCallback(function(v)
+        autoCollectDrops = v
+        Notify("Auto Collect Drops", v and "Enabled" or "Disabled", v and "Success" or "Error")
+    end)
+})
+DropsSub:AddToggle({
+    Name = "Auto Collect Floor Gear", Default = false, Flag = "gear_auto_collect",
+    Callback = function(v) autoCollectFloorGear = v end
+})
+DropsSub:AddButton({
+    Name = "Collect All Floor Gear Now", Primary = true,
+    Callback = safeCallback(function()
+        local ok = CollectAllFloorGear()
+        Notify("Floor Gear", ok and "Collected all floor items" or "Failed or no items", ok and "Success" or "Info")
+    end)
+})
+DropsSub:AddButton({
+    Name = "Collect Drops Nearby Now",
+    Callback = safeCallback(function()
+        CollectDropsNearby()
+        Notify("Drops", "Triggered collection for nearby drops", "Success")
+    end)
+})
+
+-- SubTab: Quests & Codes
+QuestsSub:AddToggle({
+    Name = "Auto Claim Achievements", Default = false, Flag = "ach_auto_claim",
+    Callback = function(v) autoClaimAchievements = v end
+})
+QuestsSub:AddToggle({
+    Name = "Auto Claim Quests (Daily/Weekly)", Default = false, Flag = "quest_auto_claim",
+    Callback = function(v) autoClaimQuests = v end
+})
+QuestsSub:AddButton({
+    Name = "Claim All Achievements Now", Primary = true,
+    Callback = safeCallback(function()
+        local ok = ClaimAllAchievements()
+        Notify("Achievements", ok and "Claimed all ready achievements" or "No unclaimed achievements", ok and "Success" or "Info")
+    end)
+})
+QuestsSub:AddButton({
+    Name = "Claim All Quests Now",
+    Callback = safeCallback(function()
+        ClaimAllQuests()
+        Notify("Quests", "Claimed all ready Daily & Weekly quests", "Success")
+    end)
+})
+QuestsSub:AddButton({
+    Name = "Redeem All Active Codes (" .. #ALL_ACTIVE_CODES .. " Codes)", Primary = true,
+    Callback = safeCallback(function()
+        Notify("Codes", "Redeeming all active codes...", "Info")
+        task.spawn(function()
+            local n = RedeemAllCodes()
+            Notify("Codes", "Redeemed active codes! (" .. n .. " successful)", "Success")
+        end)
+    end)
+})
+
+-- SubTab: Summon & Gacha
+SummonSub:AddDropdown({
+    Name = "Spin Type", Options = { "Normal", "Lucky" }, Items = { "Normal", "Lucky" }, Default = "Normal", Flag = "spin_type",
+    Callback = function(v) autoSpinType = v end
+})
+SummonSub:AddToggle({
+    Name = "Auto Spin Classes", Default = false, Flag = "spin_auto",
+    Callback = safeCallback(function(v)
+        autoSpinEnabled = v
+        Notify("Auto Spin", v and "Enabled" or "Disabled", v and "Success" or "Error")
+    end)
+})
+SummonSub:AddButton({
+    Name = "Spin Once (Normal)", Primary = true,
+    Callback = safeCallback(function()
+        local ok = SpinClass("Normal")
+        Notify("Summon", ok and "Spun normal class" or "Spin failed", ok and "Success" or "Error")
+    end)
+})
+SummonSub:AddButton({
+    Name = "Spin Once (Lucky)",
+    Callback = safeCallback(function()
+        local ok = SpinClass("Lucky")
+        Notify("Summon", ok and "Spun lucky class" or "Spin failed", ok and "Success" or "Error")
+    end)
+})
+
+-- SubTab: Shop & Stats
+ShopSub:AddToggle({
+    Name = "Auto Sell Loot Storage", Default = false, Flag = "sell_auto_loot",
+    Callback = function(v) autoSellLootStorage = v end
+})
+ShopSub:AddDropdown({
+    Name = "Stat Allocation Target", Options = { "AutoAllocate", "STR", "DEX", "INT", "VIT", "LCK", "None" },
+    Items = { "AutoAllocate", "STR", "DEX", "INT", "VIT", "LCK", "None" },
+    Default = "AutoAllocate", Flag = "stat_target", Callback = function(v) autoAllocateStatChoice = v end
+})
+ShopSub:AddToggle({
+    Name = "Auto Spend Stat Points", Default = false, Flag = "stat_auto_spend",
+    Callback = function(v) autoAllocateStats = v end
+})
+ShopSub:AddButton({
+    Name = "Sell All Loot Storage Now", Primary = true,
+    Callback = safeCallback(function()
+        local ok = SellAllLoot()
+        Notify("Shop", ok and "Sold all loot storage items" or "Failed or nothing to sell", ok and "Success" or "Info")
+    end)
+})
+ShopSub:AddButton({
+    Name = "Claim Free Daily Chest Now",
+    Callback = safeCallback(function()
+        local ok = ClaimFreeChest()
+        Notify("Chest", ok and "Claimed free daily chest" or "Chest not ready", ok and "Success" or "Info")
+    end)
+})
+ShopSub:AddButton({
+    Name = "Auto Allocate Stats Now",
+    Callback = safeCallback(function()
+        AllocateStatPoints(autoAllocateStatChoice)
+        Notify("Stats", "Allocated available stat points", "Success")
+    end)
+})
+
+-- -----------------------------------------------------------------------------
+-- TAB 3: VISUALS (ESP)
+-- -----------------------------------------------------------------------------
+local EspSettingsSub = VisualsTab:AddSubTab("ESP Configuration")
+local EspWorldSub    = VisualsTab:AddSubTab("World & Lighting")
+
+-- SubTab: ESP Configuration
+EspSettingsSub:AddToggle({
+    Name = "Master ESP Enabled", Default = false, Flag = "esp_master",
+    Callback = safeCallback(function(v)
+        esp.enabled = v
+        Notify("ESP", v and "Enabled" or "Disabled", v and "Success" or "Error")
+    end)
+})
+EspSettingsSub:AddSection("Target Filters")
+EspSettingsSub:AddToggle({ Name = "Enemies ESP", Default = true, Flag = "esp_enemies", Callback = function(v) esp.enemies = v end })
+EspSettingsSub:AddToggle({ Name = "Bosses ESP", Default = true, Flag = "esp_bosses", Callback = function(v) esp.bosses = v end })
+EspSettingsSub:AddToggle({ Name = "Chests & Altars ESP", Default = true, Flag = "esp_chests", Callback = function(v) esp.chests = v end })
+EspSettingsSub:AddToggle({ Name = "Players ESP", Default = false, Flag = "esp_players", Callback = function(v) esp.players = v end })
+EspSettingsSub:AddToggle({ Name = "Combat Dummies ESP", Default = false, Flag = "esp_dummies", Callback = function(v) esp.dummies = v end })
+
+EspSettingsSub:AddSection("Elements")
+EspSettingsSub:AddToggle({ Name = "Bounding Box", Default = true, Flag = "esp_box", Callback = function(v) esp.box = v end })
+EspSettingsSub:AddDropdown({
+    Name = "Box Style", Options = { "Corner", "Full" }, Items = { "Corner", "Full" }, Default = "Corner", Flag = "esp_box_style",
+    Callback = function(v) esp.boxStyle = v end
+})
+EspSettingsSub:AddToggle({ Name = "Name Tags", Default = true, Flag = "esp_names", Callback = function(v) esp.names = v end })
+EspSettingsSub:AddToggle({ Name = "Health Bars", Default = true, Flag = "esp_hp", Callback = function(v) esp.health = v end })
+EspSettingsSub:AddToggle({ Name = "Distance Text", Default = true, Flag = "esp_dist", Callback = function(v) esp.distance = v end })
+EspSettingsSub:AddToggle({ Name = "Snaplines / Tracers", Default = false, Flag = "esp_tracers", Callback = function(v) esp.tracers = v end })
+EspSettingsSub:AddDropdown({
+    Name = "Tracer Origin", Options = { "Bottom", "Center", "Mouse" }, Items = { "Bottom", "Center", "Mouse" }, Default = "Bottom", Flag = "esp_tracer_origin",
+    Callback = function(v) esp.tracerOrigin = v end
+})
+EspSettingsSub:AddToggle({ Name = "Chams / Highlights", Default = true, Flag = "esp_chams", Callback = function(v) esp.chams = v end })
+EspSettingsSub:AddSlider({ Name = "Max ESP Distance", Min = 50, Max = 1500, Default = 600, Suffix = " studs", Flag = "esp_maxdist", Callback = function(v) esp.maxDistance = v end })
+
+-- SubTab: World & Lighting
+EspWorldSub:AddToggle({
+    Name = "Fullbright (Max Brightness)", Default = false, Flag = "world_fullbright",
+    Callback = safeCallback(function(v)
+        SetFullbright(v)
+        Notify("Fullbright", v and "Enabled" or "Disabled", v and "Success" or "Error")
+    end)
+})
+EspWorldSub:AddSection("ESP Colors")
+EspWorldSub:AddColorPicker({ Name = "Enemy Color", Default = esp.enemyColor, Flag = "col_enemy", Callback = function(c) esp.enemyColor = c end })
+EspWorldSub:AddColorPicker({ Name = "Boss Color", Default = esp.bossColor, Flag = "col_boss", Callback = function(c) esp.bossColor = c end })
+EspWorldSub:AddColorPicker({ Name = "Chest Color", Default = esp.chestColor, Flag = "col_chest", Callback = function(c) esp.chestColor = c end })
+EspWorldSub:AddColorPicker({ Name = "Player Color", Default = esp.playerColor, Flag = "col_player", Callback = function(c) esp.playerColor = c end })
+EspWorldSub:AddColorPicker({ Name = "Dummy Color", Default = esp.dummyColor, Flag = "col_dummy", Callback = function(c) esp.dummyColor = c end })
+
+-- -----------------------------------------------------------------------------
+-- TAB 4: PLAYER & MOVEMENT
+-- -----------------------------------------------------------------------------
+local MoveSub = PlayerTab:AddSubTab("Movement")
+local TeleSub = PlayerTab:AddSubTab("Teleports")
+
+-- SubTab: Movement
+MoveSub:AddToggle({
+    Name = "Enable WalkSpeed", Default = false, Flag = "speed_enabled",
+    Callback = safeCallback(function(v)
+        walkSpeedEnabled = v
+        if not v then
+            local hum = GetHumanoid()
+            if hum then hum.WalkSpeed = 16 end
+        end
+        Notify("WalkSpeed", v and "Enabled" or "Disabled", v and "Success" or "Error")
+    end)
+})
+MoveSub:AddSlider({
+    Name = "WalkSpeed Multiplier", Min = 16, Max = 200, Default = 24, Suffix = " studs/s", Flag = "speed_val",
+    Callback = function(v) ApplyWalkSpeed(v) end
+})
+MoveSub:AddToggle({
+    Name = "Enable JumpPower", Default = false, Flag = "jump_enabled",
+    Callback = safeCallback(function(v)
+        jumpPowerEnabled = v
+        if not v then
+            local hum = GetHumanoid()
+            if hum then hum.JumpPower = 50 end
+        end
+        Notify("JumpPower", v and "Enabled" or "Disabled", v and "Success" or "Error")
+    end)
+})
+MoveSub:AddSlider({
+    Name = "JumpPower", Min = 50, Max = 300, Default = 60, Suffix = "", Flag = "jump_val",
+    Callback = function(v) ApplyJumpPower(v) end
+})
+MoveSub:AddToggle({
+    Name = "Infinite Jump", Default = false, Flag = "inf_jump",
+    Callback = function(v) infiniteJump = v end
+})
+MoveSub:AddToggle({
+    Name = "Smooth Fly (WASD + Space/Shift)", Default = false, Flag = "fly_enabled",
+    Callback = safeCallback(function(v)
+        if v then startFly() else stopFly() end
+        Notify("Fly", v and "Enabled" or "Disabled", v and "Success" or "Error")
+    end)
+})
+MoveSub:AddSlider({
+    Name = "Fly Speed", Min = 20, Max = 250, Default = 60, Suffix = " studs/s", Flag = "fly_speed",
+    Callback = function(v) flySpeed = v end
+})
+MoveSub:AddToggle({
+    Name = "Noclip (Walk Through Walls)", Default = false, Flag = "noclip_enabled",
+    Callback = safeCallback(function(v)
+        noclip = v
+        if not v then
+            local char = GetCharacter()
+            if char then
+                for _, p in ipairs(char:GetDescendants()) do
+                    if p:IsA("BasePart") then p.CanCollide = true end
+                end
+            end
+        end
+        Notify("Noclip", v and "Enabled" or "Disabled", v and "Success" or "Error")
+    end)
+})
+MoveSub:AddToggle({
+    Name = "Anti-AFK (Bypass 20min Kick)", Default = false, Flag = "anti_afk",
+    Callback = function(v) SetAntiAFK(v) end
+})
+
+-- SubTab: Teleports
+TeleSub:AddSection("Lobby Portals & Areas")
+TeleSub:AddDropdown({
+    Name = "Select Location", Options = locKeys, Items = locKeys, Default = "Spawn 1", Flag = "tele_loc",
+    Callback = function(v) selectedLobbyLocation = v end
+})
+TeleSub:AddButton({
+    Name = "Teleport to Location", Primary = true,
+    Callback = safeCallback(function()
+        local pos = LOBBY_LOCATIONS[selectedLobbyLocation]
+        if pos and TeleportTo(pos) then
+            Notify("Teleport", "Teleported to " .. selectedLobbyLocation, "Success")
+        else
+            Notify("Teleport", "Teleport failed", "Error")
+        end
+    end)
+})
+
+TeleSub:AddSection("Lobby NPCs")
+TeleSub:AddDropdown({
+    Name = "Select NPC", Options = npcKeys, Items = npcKeys, Default = "Guide", Flag = "tele_npc",
+    Callback = function(v) selectedLobbyNpc = v end
+})
+TeleSub:AddButton({
+    Name = "Teleport to NPC", Primary = true,
+    Callback = safeCallback(function()
+        local pos = LOBBY_NPCS[selectedLobbyNpc]
+        if pos and TeleportTo(pos) then
+            Notify("Teleport", "Teleported to " .. selectedLobbyNpc, "Success")
+        else
+            Notify("Teleport", "Teleport failed", "Error")
+        end
+    end)
+})
+
+TeleSub:AddSection("Combat Teleports")
+TeleSub:AddButton({
+    Name = "Teleport to Nearest Enemy / Mob",
+    Callback = safeCallback(function()
+        local target = GetClosestTarget("Target Nearest", 2500)
+        if target and target.Pos and TeleportTo(target.Pos + Vector3.new(0, 2, 4)) then
+            Notify("Teleport", "Teleported near " .. target.Model.Name, "Success")
+        else
+            Notify("Teleport", "No target found in range", "Info")
+        end
+    end)
+})
+
+-- -----------------------------------------------------------------------------
+-- TAB 5: SETTINGS & CONFIG
+-- -----------------------------------------------------------------------------
+local ConfigSub = SettingsTab:AddSubTab("Configuration")
+
+if HAS_CONFIG then
+    ConfigSub:AddInput({
+        Name = "Config Name", Default = CONFIG_NAME, Flag = "cfg_name",
+        Callback = function(v) if v and #v > 0 then CONFIG_NAME = v end end
+    })
+    ConfigSub:AddButton({
+        Name = "Save Config", Primary = true,
+        Callback = safeCallback(function()
+            local ok, err = Library:SaveConfig(CONFIG_NAME)
+            Notify("Config", ok and ("Saved config '" .. CONFIG_NAME .. "'") or ("Save failed: " .. tostring(err)), ok and "Success" or "Error")
+        end)
+    })
+    ConfigSub:AddButton({
+        Name = "Load Config",
+        Callback = safeCallback(function()
+            local ok, err = Library:LoadConfig(CONFIG_NAME)
+            if ok then
+                ResyncAll()
+                Notify("Config", "Loaded config '" .. CONFIG_NAME .. "'", "Success")
+            else
+                Notify("Config", "Load failed: " .. tostring(err), "Error")
+            end
+        end)
+    })
+end
+
+ConfigSub:AddKeybind({
+    Name = "Toggle UI Keybind", Default = Enum.KeyCode.RightControl, Flag = "ui_toggle_key",
+    OnPress = function()
+        Window:Toggle()
+    end
+})
+
+ConfigSub:AddDivider()
+
+ConfigSub:AddButton({
+    Name = "Unload Oxide HUB",
+    Callback = safeCallback(function()
+        pcall(function() HUB.Unload() end)
+    end)
+})
+
+ConfigSub:AddParagraph({
+    Title = "Oxide HUB | Dungeon-Lootr",
+    Content = "Version 1.2.0 (Production)\nDeveloped for Dungeon-Lootr.\nIncludes full combat aura, automated AFK dungeon grinder, drops collector, instant-teleport room & boss chest looter, mid-run & end-run auto reward claims, ESP suite and movement exploits."
+})
+
+-- ==============================================================================
+-- HUB CLEANUP & UNLOAD HANDLER
+-- ==============================================================================
+HUB.Unload = function()
+    HUB.dead = true
+    for _, c in ipairs(HUB.conns) do pcall(function() c:Disconnect() end) end
+    HUB.conns = {}
+
+    for _, d in ipairs(HUB.drawings) do pcall(function() d:Remove() end) end
+    HUB.drawings = {}
+
+    for _, h in ipairs(HUB.highlights) do pcall(function() h:Destroy() end) end
+    HUB.highlights = {}
+
+    stopFly()
+    SetFullbright(false)
+    local hum = GetHumanoid()
+    if hum then
+        hum.WalkSpeed = 16
+        hum.JumpPower = 50
+    end
+    local char = GetCharacter()
+    if char then
+        for _, p in ipairs(char:GetDescendants()) do
+            if p:IsA("BasePart") then p.CanCollide = true end
+        end
+    end
+
+    pcall(function() Window:Destroy() end)
+    _G.OxideDungeonLootr = nil
+end
+
+Notify("Oxide HUB", "Dungeon-Lootr script loaded successfully!", "Success", 3.5)
