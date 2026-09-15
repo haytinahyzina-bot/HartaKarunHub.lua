@@ -25,7 +25,6 @@ _G.HK.esp = false
 _G.HK.loot = true
 _G.HK.dropLoot = false
 _G.HK.speed = 28
-_G.HK.jump = _G.HK.jump or 50 -- PATCH: default jump hack
 _G.HK.noclip = false
 _G.HK.infjump = false
 _G.HK.fly = false
@@ -237,11 +236,6 @@ RS.Heartbeat:Connect(function()
     if hum.WalkSpeed ~= _G.HK.speed then
         hum.WalkSpeed = _G.HK.speed
     end
-    -- PATCH: jump hack (JumpPower lock)
-    if hum.JumpPower ~= _G.HK.jump then
-        hum.JumpPower = _G.HK.jump
-    end
-    if hum.UseJumpPower == false then hum.UseJumpPower = true end
     if _G.HK.fly then
         local cf = hrp.CFrame
         local mv = Vector3.new()
@@ -262,7 +256,7 @@ RS.Heartbeat:Connect(function()
     end
     if _G.HK.hx and mob then
         local pos = mobPos(mob)
-        -- PATCH: patokan kepala bila ada (jatuh 14 = di atas kepala)
+        -- HOVER: patokan kepala bila ada (tinggi = di atas kepala)
         local head = mob:FindFirstChild("Head")
         if head and head:IsA("BasePart") then pos = head.Position end
         if pos then
@@ -274,7 +268,7 @@ RS.Heartbeat:Connect(function()
             if h < 4 then
                 h = 4
             end
-            -- PATCH: tidur tengkurap, kepala menghadap ke mob di bawah
+            -- HOVER: tidur tengkurap, kepala menghadap ke mob di bawah
             hrp.CFrame = CFrame.lookAt(pos + Vector3.new(0, h, 0), pos) * CFrame.Angles(math.rad(90), 0, 0)
             hrp.Velocity = Vector3.new()
             hrp.RotVelocity = Vector3.new()
@@ -1565,7 +1559,7 @@ _G.HK.loot = false
 _G.HK.chest = false
 _G.HK.stealth = false
 _G.HK.infjump = false
-_G.HK.height = _G.HK.height or 14
+_G.HK.height = _G.HK.height or 6.5
 _G.HK.rate = _G.HK.rate or 0.25
 _G.HK.atkRange = _G.HK.atkRange or 15
 _G.HK.speed = _G.HK.speed or 32
@@ -1622,7 +1616,7 @@ FarmL:AddToggle("HKHover", {
 })
 FarmL:AddSlider("HKHeight", {
     Text = "Tinggi hover",
-    Default = 14, Min = 4, Max = 30, Rounding = 1,
+    Default = math.min(_G.HK.height, 30), Min = 4, Max = 30, Rounding = 1,
     Callback = function(v) _G.HK.height = v end,
 })
 FarmL:AddToggle("HKChest", {
@@ -1796,11 +1790,6 @@ M2:AddSlider("HKFlySpd", {
     Default = _G.HK.flyspeed, Min = 20, Max = 150, Rounding = 0,
     Callback = function(v) _G.HK.flyspeed = v end,
 })
-M2:AddSlider("HKJump", {
-    Text = "Jump high",
-    Default = _G.HK.jump, Min = 50, Max = 250, Rounding = 0,
-    Callback = function(v) _G.HK.jump = v end,
-})
 
 -- ===== TAB MISC =====
 local MiscTab = Window:AddTab("Misc", "package")
@@ -1939,3 +1928,87 @@ lib:Notify({
     Time = 5,
 })
 print("[HK] UI Obsidian aktif")
+
+-- PATCH: auto blessing 1/2/3 + auto pick chest 2-dari-3 (habis bunuh boss)
+-- Ganti pilihan berkat live via: _G.HKBlessPick = 1 / 2 / 3 (default 1 = kiri)
+_G.HKBlessPick = _G.HKBlessPick or 1
+task.spawn(function()
+    local ok, svc = pcall(function()
+        return game.ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"]
+            .knit.Services.DungeonBuffService
+    end)
+    if not ok or not svc then return end
+    local function pickNow()
+        local pick = tonumber(_G.HKBlessPick) or 1
+        if pick < 1 or pick > 3 then pick = 1 end
+        local id = nil
+        pcall(function()
+            local opts = _G.HKLastBless and _G.HKLastBless[1]
+            if type(opts) == "table" and type(opts[pick]) == "table" and opts[pick].Id then
+                id = tostring(opts[pick].Id)
+            end
+        end)
+        if id then pcall(function() svc.RF.SelectBuff:InvokeServer(id) end) end
+        pcall(function() svc.RF.SelectBuff:InvokeServer(pick) end)
+    end
+    pcall(function()
+        svc.RE.BuffSelection.OnClientEvent:Connect(function(...)
+            _G.HKLastBless = { ... }
+            task.wait(0.3)
+            pickNow()
+        end)
+    end)
+    -- poller cadangan tiap 2 detik (PlayerGui + CoreGui)
+    while true do
+        pcall(function()
+            local found = false
+            for _, root in ipairs({ game.Players.LocalPlayer.PlayerGui, game:GetService("CoreGui") }) do
+                for _, d in ipairs(root:GetDescendants()) do
+                    if d:IsA("TextLabel") and d.Text == "PILIH BERKAT:" then found = true break end
+                end
+                if found then break end
+            end
+            if found then pickNow() end
+        end)
+        task.wait(2)
+    end
+end)
+
+-- Auto pick chest 2-dari-3: event + poller judul "Pilih 2 Peti:"
+task.spawn(function()
+    local drs = nil
+    pcall(function()
+        drs = game.ReplicatedStorage.Packages._Index["sleitnick_knit@1.7.0"]
+            .knit.Services.DungeonRunService
+    end)
+    if not drs then return end
+    local function claimChests()
+        pcall(function() drs.RF.SelectMidRunChests:InvokeServer({ 1, 2 }) end)
+        pcall(function() drs.RF.SelectChests:InvokeServer({ 1, 2 }) end)
+        pcall(function()
+            local cf = game.Players.LocalPlayer.PlayerGui.Main.HUD:FindFirstChild("Chest_Selection")
+            if cf then cf.Visible = false end
+        end)
+    end
+    pcall(function()
+        drs.RE.MidRunChestSelection.OnClientEvent:Connect(function() task.wait(0.3) claimChests() end)
+    end)
+    pcall(function()
+        drs.RE.ChestSelection.OnClientEvent:Connect(function() task.wait(0.3) claimChests() end)
+    end)
+    while true do
+        pcall(function()
+            local found = false
+            for _, root in ipairs({ game.Players.LocalPlayer.PlayerGui, game:GetService("CoreGui") }) do
+                for _, d in ipairs(root:GetDescendants()) do
+                    if d:IsA("TextLabel") and string.find(d.Text, "Pilih 2 Peti") then found = true break end
+                end
+                if found then break end
+            end
+            if found then claimChests() end
+        end)
+        task.wait(2)
+    end
+end)
+
+print("[HK] patch aktif: auto-blessing + auto-chest")
