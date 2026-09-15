@@ -251,8 +251,14 @@ end)
 local function FightTarget(t)
     local hrp = HRP()
     if not hrp then return end
-    local hover = t.Pos + Vector3.new(0, Config.HoverHeight, 0)
-    hrp.CFrame = CFrame.lookAt(hover, t.Pos) * CFrame.Angles(math.rad(90), 0, 0)
+    -- patokan KEPALA mob (bukan tengah badan): 14 studs di atas kepala
+    local headPos = t.Pos
+    if t.Model then
+        local head = t.Model:FindFirstChild("Head")
+        if head and head:IsA("BasePart") then headPos = head.Position end
+    end
+    local hover = headPos + Vector3.new(0, Config.HoverHeight, 0)
+    hrp.CFrame = CFrame.lookAt(hover, headPos) * CFrame.Angles(math.rad(90), 0, 0)
     local dist = (t.Pos - hrp.Position).Magnitude
     if dist <= Config.SkillRange + 15 then -- di luar jarak: jangan buang cooldown
         local dir = (t.Pos - hrp.Position).Unit
@@ -274,7 +280,7 @@ local function MobsNear(center, radius)
             local cf = PivotOf(d)
             if cf and (cf.Position - center).Magnitude <= radius then
                 local dist = hrp and (cf.Position - hrp.Position).Magnitude or 0
-                table.insert(list, { Pos = cf.Position, Dist = dist })
+                table.insert(list, { Model = d, Pos = cf.Position, Dist = dist })
             end
         end
     end
